@@ -86,7 +86,12 @@ const NIP34_STATUS_KINDS = [
 ];
 
 function normalizeRawUrl(value: unknown): string {
-  return typeof value === "string" ? value.trim() : "[invalid reference]";
+  if (typeof value === "string") return value.trim();
+  if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+    const url = (value as { url?: unknown }).url;
+    if (typeof url === "string") return url.trim();
+  }
+  return "[invalid reference]";
 }
 
 function unsupportedReference(

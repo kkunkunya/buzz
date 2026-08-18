@@ -23,6 +23,7 @@ function response(body, status = 200) {
 test("parses canonical Buzz, GitHub, malformed, and unsupported references", () => {
   const refs = parseWorkstreamPullRequestReferences([
     buzz,
+    { url: "https://github.com/Block/Buzz/pull/42", label: "labeled PR" },
     "https://github.com/Block/Buzz/pull/42",
     "https://github.com/block/buzz/issues/42",
     "https://example.com/pr/1",
@@ -33,11 +34,12 @@ test("parses canonical Buzz, GitHub, malformed, and unsupported references", () 
   assert.equal(refs[0].identity, `buzz:${OWNER}:buzz:${EVENT}`);
   assert.equal(refs[1].kind, "github");
   assert.equal(refs[1].href, "https://github.com/block/buzz/pull/42");
-  assert.equal(refs[2].kind, "unsupported");
-  assert.equal(refs[2].reason, "malformed");
-  assert.equal(refs[3].reason, "unsupported-provider");
-  assert.equal(refs[4].reason, "malformed");
-  assert.equal(refs[5].reason, "invalid-field");
+  assert.equal(refs[2].kind, "github");
+  assert.equal(refs[3].kind, "unsupported");
+  assert.equal(refs[3].reason, "malformed");
+  assert.equal(refs[4].reason, "unsupported-provider");
+  assert.equal(refs[5].reason, "malformed");
+  assert.equal(refs[6].reason, "invalid-field");
 });
 
 test("GitHub status reports lifecycle and latest review state", async () => {
