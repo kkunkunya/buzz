@@ -202,3 +202,24 @@ test("derived reviewer waits cover all unapproved open review states and exclude
   ]);
   assert.equal(deriveReviewerWaits([reference], approved).length, 0);
 });
+
+test("manual wording overlays an identical derived PR key while a deleted manual wait leaves the derived wait", () => {
+  const derived = [
+    {
+      key: "github:block/buzz#4",
+      actor: { kind: "team", name: "Reviewers" },
+      reason: "Review requested",
+      source: "derived",
+    },
+  ];
+  const manual = [
+    {
+      key: "github:block/buzz#4",
+      actor: { kind: "team", name: "Release reviewers" },
+      reason: "Please review release notes",
+      source: "manual",
+    },
+  ];
+  assert.deepEqual(mergeWorkstreamWaits(manual, derived), manual);
+  assert.deepEqual(mergeWorkstreamWaits([], derived), derived);
+});
