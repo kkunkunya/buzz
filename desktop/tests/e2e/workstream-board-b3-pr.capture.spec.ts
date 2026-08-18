@@ -6,9 +6,25 @@ test("continuous relay-backed Workstream Board bullet 3 PR-status demo", async (
   page,
 }, testInfo) => {
   test.setTimeout(120_000);
-  await installRelayBridge(page, "tyler", {
-    seedPreviewFeatures: true,
-    relayPullRequestQueryDelayMs: 2_500,
+  await installRelayBridge(page, "tyler", { seedPreviewFeatures: true });
+  await page.routeWebSocket(/localhost:3000/, (socket) => {
+    const server = socket.connectToServer();
+    server.onMessage((message) => {
+      if (typeof message === "string") {
+        try {
+          const payload = JSON.parse(message) as unknown[];
+          const event = payload[2] as { kind?: unknown } | undefined;
+          if (payload[0] === "EVENT" && event?.kind === 1618) {
+            setTimeout(() => socket.send(message), 2_500);
+            return;
+          }
+        } catch {
+          // Pass non-JSON relay frames through unchanged.
+        }
+      }
+      socket.send(message);
+    });
+    socket.onMessage((message) => server.send(message));
   });
   await page.goto("/", { waitUntil: "domcontentloaded" });
   await expect(page.getByTestId("app-sidebar")).toBeVisible();
