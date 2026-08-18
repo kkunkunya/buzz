@@ -130,3 +130,75 @@ test("sorting authenticates the current owner by pubkey and remains stable acros
     ordered,
   );
 });
+
+test("derived reviewer waits cover all unapproved open review states and exclude approved or terminal states", () => {
+  const reference = {
+    kind: "github",
+    identity: "github:block/buzz#2",
+    rawUrl: "https://github.com/block/buzz/pull/2",
+    href: "https://github.com/block/buzz/pull/2",
+    owner: "block",
+    repository: "buzz",
+    number: 2,
+  };
+  for (const reviewState of [
+    "no-reviews",
+    "review-requested",
+    "changes-requested",
+  ]) {
+    const states = new Map([
+      [
+        reference.identity,
+        {
+          status: "live",
+          provider: "github",
+          href: reference.href,
+          repository: "block/buzz",
+          number: 2,
+          title: "Two",
+          lifecycle: "open",
+          reviewState,
+        },
+      ],
+    ]);
+    assert.equal(
+      deriveReviewerWaits([reference], states).length,
+      1,
+      reviewState,
+    );
+  }
+  for (const lifecycle of ["draft", "merged", "closed"]) {
+    const states = new Map([
+      [
+        reference.identity,
+        {
+          status: "live",
+          provider: "github",
+          href: reference.href,
+          repository: "block/buzz",
+          number: 2,
+          title: "Two",
+          lifecycle,
+          reviewState: "review-requested",
+        },
+      ],
+    ]);
+    assert.equal(deriveReviewerWaits([reference], states).length, 0, lifecycle);
+  }
+  const approved = new Map([
+    [
+      reference.identity,
+      {
+        status: "live",
+        provider: "github",
+        href: reference.href,
+        repository: "block/buzz",
+        number: 2,
+        title: "Two",
+        lifecycle: "open",
+        reviewState: "approved",
+      },
+    ],
+  ]);
+  assert.equal(deriveReviewerWaits([reference], approved).length, 0);
+});
