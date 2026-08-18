@@ -6,21 +6,13 @@ test("continuous relay-backed Workstream Board bullet 3 PR-status demo", async (
   page,
 }, testInfo) => {
   test.setTimeout(120_000);
-  await installRelayBridge(page, "tyler", { seedPreviewFeatures: true });
+  await installRelayBridge(page, "tyler", {
+    seedPreviewFeatures: true,
+    relayPullRequestQueryDelayMs: 2_500,
+  });
   await page.goto("/", { waitUntil: "domcontentloaded" });
   await expect(page.getByTestId("app-sidebar")).toBeVisible();
   await expect(page.getByTestId("open-workstream-board-view")).toBeVisible();
-  // Hold only the authenticated NIP-34 root query long enough for the
-  // continuous artifact to show the promised loading -> live transition.
-  await page.route("http://localhost:3000/query", async (route) => {
-    const body = route.request().postDataJSON() as Array<{
-      kinds?: number[];
-    }> | null;
-    if (body?.some((filter) => filter.kinds?.includes(1618))) {
-      await new Promise((resolve) => setTimeout(resolve, 1_500));
-    }
-    await route.continue();
-  });
   await page.getByTestId("open-workstream-board-view").click();
 
   const board = page.getByTestId("workstream-board-view");
@@ -58,7 +50,8 @@ test("continuous relay-backed Workstream Board bullet 3 PR-status demo", async (
 
   const pullRequest = card.getByTestId("workstream-pull-request");
   await expect(pullRequest).toBeVisible();
-  await expect(pullRequest).toContainText(/Loading…|B3 linked PR/);
+  await expect(pullRequest).toContainText("Loading…");
+  await page.waitForTimeout(1_000);
   await page.screenshot({
     path: testInfo.outputPath("b3-loading.png"),
     fullPage: true,
