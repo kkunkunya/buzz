@@ -507,8 +507,14 @@ export function createWorkstreamPollingRegistry(
 
 const defaultWorkstreamPollingRegistry = createWorkstreamPollingRegistry();
 
+type WorkstreamPollingRegistry = Pick<
+  ReturnType<typeof createWorkstreamPollingRegistry>,
+  "subscribe"
+>;
+
 export function useWorkstreamPullRequestStatuses(
   references: readonly WorkstreamPullRequestReference[],
+  pollingRegistry: WorkstreamPollingRegistry = defaultWorkstreamPollingRegistry,
 ): ReadonlyMap<string, WorkstreamPullRequestDisplayState> {
   const [states, setStates] = React.useState<
     ReadonlyMap<string, WorkstreamPullRequestDisplayState>
@@ -520,34 +526,37 @@ export function useWorkstreamPullRequestStatuses(
   }, [references]);
 
   React.useEffect(() => {
-    const next = new Map<string, WorkstreamPullRequestDisplayState>();
+    const initial = new Map<string, WorkstreamPullRequestDisplayState>();
+    for (const reference of referencesByIdentity.values()) {
+      initial.set(
+        reference.identity,
+        reference.kind === "unsupported"
+          ? {
+              status: "unsupported",
+              href: reference.href,
+              reason: reference.reason,
+            }
+          : { status: "loading" },
+      );
+    }
+    setStates(initial);
+
     const unsubscribers: Array<() => void> = [];
     for (const reference of referencesByIdentity.values()) {
-      if (reference.kind === "unsupported") {
-        next.set(reference.identity, {
-          status: "unsupported",
-          href: reference.href,
-          reason: reference.reason,
+      if (reference.kind === "unsupported") continue;
+      const unsubscribe = pollingRegistry.subscribe(reference, (state) => {
+        setStates((current) => {
+          const updated = new Map(current);
+          updated.set(reference.identity, state);
+          return updated;
         });
-        continue;
-      }
-      const unsubscribe = defaultWorkstreamPollingRegistry.subscribe(
-        reference,
-        (state) => {
-          setStates((current) => {
-            const updated = new Map(current);
-            updated.set(reference.identity, state);
-            return updated;
-          });
-        },
-      );
+      });
       unsubscribers.push(unsubscribe);
     }
-    setStates(next);
     return () => {
       for (const unsubscribe of unsubscribers) unsubscribe();
     };
-  }, [referencesByIdentity]);
+  }, [pollingRegistry, referencesByIdentity]);
 
   return states;
 }

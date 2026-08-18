@@ -9,13 +9,34 @@ test("continuous relay-backed Workstream Board bullet 3 PR-status demo", async (
   await installRelayBridge(page, "tyler", { seedPreviewFeatures: true });
   await page.routeWebSocket(/localhost:3000/, (socket) => {
     const server = socket.connectToServer();
+    let delayedPrSubscription: string | null = null;
+    let delayedFrames: string[] = [];
+    let releaseScheduled = false;
+    const release = () => {
+      const frames = delayedFrames;
+      delayedFrames = [];
+      delayedPrSubscription = null;
+      releaseScheduled = false;
+      for (const frame of frames) socket.send(frame);
+    };
     server.onMessage((message) => {
       if (typeof message === "string") {
         try {
           const payload = JSON.parse(message) as unknown[];
+          const type = payload[0];
+          const subId = typeof payload[1] === "string" ? payload[1] : null;
           const event = payload[2] as { kind?: unknown } | undefined;
-          if (payload[0] === "EVENT" && event?.kind === 1618) {
-            setTimeout(() => socket.send(message), 2_500);
+          if (type === "EVENT" && event?.kind === 1618 && subId) {
+            delayedPrSubscription = subId;
+            delayedFrames.push(message);
+            if (!releaseScheduled) {
+              releaseScheduled = true;
+              setTimeout(release, 2_500);
+            }
+            return;
+          }
+          if (type === "EOSE" && subId === delayedPrSubscription) {
+            delayedFrames.push(message);
             return;
           }
         } catch {

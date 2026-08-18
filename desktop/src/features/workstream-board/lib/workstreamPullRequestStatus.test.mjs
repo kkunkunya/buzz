@@ -1,5 +1,21 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import { after, before, test } from "node:test";
+import { JSDOM } from "jsdom";
+
+const dom = new JSDOM("<!doctype html><html><body></body></html>", {
+  url: "http://localhost",
+});
+
+before(() => {
+  Object.assign(globalThis, {
+    document: dom.window.document,
+    HTMLElement: dom.window.HTMLElement,
+    IS_REACT_ACT_ENVIRONMENT: true,
+    window: dom.window,
+  });
+});
+
+after(() => dom.window.close());
 
 import {
   createWorkstreamPollingRegistry,
@@ -154,4 +170,102 @@ test("polling deduplicates canonical identities and tears down", async () => {
   assert.equal(registry.entryCount(), 0);
   assert.equal(aborted, true);
   resolveRequest();
+});
+
+test("workstream status hook exposes loading before a supported PR resolves", async () => {
+  const { cleanup, renderHook } = await import("@testing-library/react");
+  const { useWorkstreamPullRequestStatuses } = await import(
+    "./workstreamPullRequestStatus.ts"
+  );
+  const reference = parseWorkstreamPullRequestReference(
+    "https://github.com/block/buzz/pull/42",
+  );
+  const registry = createWorkstreamPollingRegistry({
+    fetcher: () => new Promise(() => {}),
+  });
+  const references = [reference];
+  const { result, unmount } = renderHook(() =>
+    useWorkstreamPullRequestStatuses(references, registry),
+  );
+  assert.deepEqual(result.current.get(reference.identity), {
+    status: "loading",
+  });
+  unmount();
+  cleanup();
+});
+
+test("workstream status hook preserves a synchronous live callback", async () => {
+  const { act, cleanup, renderHook } = await import("@testing-library/react");
+  const { useWorkstreamPullRequestStatuses } = await import(
+    "./workstreamPullRequestStatus.ts"
+  );
+  const reference = parseWorkstreamPullRequestReference(
+    "https://github.com/block/buzz/pull/42",
+  );
+  const registry = createWorkstreamPollingRegistry({
+    fetcher: async (url) =>
+      String(url).endsWith("/reviews?per_page=100")
+        ? response([])
+        : response({ number: 42, title: "Board", state: "open", draft: false }),
+    maxPolls: 1,
+  });
+  const prime = registry.subscribe(reference, () => {});
+  await act(async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+  const references = [reference];
+  const { result, unmount } = renderHook(() =>
+    useWorkstreamPullRequestStatuses(references, registry),
+  );
+  await act(async () => {
+    await Promise.resolve();
+  });
+  assert.deepEqual(result.current.get(reference.identity), {
+    status: "live",
+    provider: "github",
+    href: "https://github.com/block/buzz/pull/42",
+    repository: "block/buzz",
+    number: 42,
+    title: "Board",
+    lifecycle: "open",
+    reviewState: "no-reviews",
+  });
+  unmount();
+  prime();
+  cleanup();
+});
+
+test("workstream status hook removes stale references and preserves unsupported state", async () => {
+  const { act, cleanup, renderHook } = await import("@testing-library/react");
+  const { useWorkstreamPullRequestStatuses } = await import(
+    "./workstreamPullRequestStatus.ts"
+  );
+  const supported = parseWorkstreamPullRequestReference(
+    "https://github.com/block/buzz/pull/42",
+  );
+  const unsupported = parseWorkstreamPullRequestReference(
+    "https://example.com/pr/1",
+  );
+  const registry = createWorkstreamPollingRegistry({
+    fetcher: () => new Promise(() => {}),
+  });
+  const { result, rerender, unmount } = renderHook(
+    ({ refs }) => useWorkstreamPullRequestStatuses(refs, registry),
+    { initialProps: { refs: [supported, unsupported] } },
+  );
+  assert.deepEqual(
+    result.current.get(unsupported.identity)?.status,
+    "unsupported",
+  );
+  await act(async () => {
+    rerender({ refs: [unsupported] });
+  });
+  assert.equal(result.current.has(supported.identity), false);
+  assert.deepEqual(
+    result.current.get(unsupported.identity)?.status,
+    "unsupported",
+  );
+  unmount();
+  cleanup();
 });
