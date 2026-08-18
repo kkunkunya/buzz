@@ -42,10 +42,13 @@ function referenceLabel(reference: WorkstreamPullRequestReference) {
 
 export function WorkstreamPullRequests({
   references,
+  states: providedStates,
 }: {
   references: readonly WorkstreamPullRequestReference[];
+  states?: ReadonlyMap<string, WorkstreamPullRequestDisplayState>;
 }) {
-  const states = useWorkstreamPullRequestStatuses(references);
+  const queriedStates = useWorkstreamPullRequestStatuses(references);
+  const states = providedStates ?? queriedStates;
   const openEntityLink = useOpenEntityLink();
 
   return (
