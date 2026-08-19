@@ -702,7 +702,6 @@ mod update;
 pub use update::update_managed_agent;
 pub(super) use update::{flush_managed_agent_policy, managed_agent_access_policy_changed};
 
-
 // ── Model normalization ───────────────────────────────────────────────────────
 /// Normalize raw `buzz-acp models --json` output into a typed DTO for the frontend.
 ///
