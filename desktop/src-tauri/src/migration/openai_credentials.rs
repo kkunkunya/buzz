@@ -1,367 +1,792 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::{Path, PathBuf},
+};
 
-use serde_json::{Map, Value};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::managed_agents::{
+    effective_config::{resolve_effective_config, ConfigSource, EffectiveConfigResult},
+    AgentDefinition, GlobalAgentConfig, ManagedAgentRecord,
+};
 
 const OPENAI_API_KEY: &str = "OPENAI_API_KEY";
 const OPENAI_COMPAT_API_KEY: &str = "OPENAI_COMPAT_API_KEY";
 const OPENAI_COMPAT_BASE_URL: &str = "OPENAI_COMPAT_BASE_URL";
-const MIGRATION_SUFFIX: &str = "openai-credentials-v1.migrated";
+const CANONICAL_OPENAI_ORIGIN: &str = "https://api.openai.com/v1";
+const MARKER_FILE: &str = ".openai-credentials-v1.migrated";
+const MANIFEST_FILE: &str = ".openai-credentials-v1.transaction.json";
 const BACKUP_SUFFIX: &str = "pre-openai-credentials-v1.bak";
 
-fn uses_official_openai_endpoint(
-    env_vars: Option<&Map<String, Value>>,
-    inherited_env_vars: Option<&Map<String, Value>>,
-) -> bool {
-    let Some(base_url) = env_vars
-        .and_then(|env| env.get(OPENAI_COMPAT_BASE_URL))
-        .or_else(|| inherited_env_vars.and_then(|env| env.get(OPENAI_COMPAT_BASE_URL)))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return true;
-    };
-    let Ok(url) = url::Url::parse(base_url) else {
-        return false;
-    };
-    url.scheme() == "https"
-        && url
-            .host_str()
-            .is_some_and(|host| host.eq_ignore_ascii_case("api.openai.com"))
-        && url.port_or_known_default() == Some(443)
-        && url.username().is_empty()
-        && url.password().is_none()
-        && matches!(url.path().trim_end_matches('/'), "" | "/v1")
-        && url.query().is_none()
-        && url.fragment().is_none()
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Owner {
+    Global,
+    Record(usize),
+    Baked,
+    Harness(String),
+    BuiltinDefinition(String),
 }
 
-fn migrate_openai_credential_record(
-    record: &mut Map<String, Value>,
-    effective_provider: Option<&str>,
-    inherited_env_vars: Option<&Map<String, Value>>,
-    owns_effective_provider: bool,
-) -> Result<bool, String> {
-    let local_provider = record
-        .get("provider")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|provider| !provider.is_empty());
-    let Some(provider) = effective_provider
-        .or(local_provider)
-        .map(str::to_ascii_lowercase)
-        .filter(|provider| matches!(provider.as_str(), "openai" | "openai-compat"))
-    else {
-        return Ok(false);
-    };
-    let official_endpoint = uses_official_openai_endpoint(
-        record.get("env_vars").and_then(Value::as_object),
-        inherited_env_vars,
-    );
-    let target_provider = if official_endpoint {
-        "openai"
-    } else {
-        "openai-compat"
-    };
-    let mut changed = false;
-    if provider != target_provider {
-        if !owns_effective_provider {
-            return Err(format!(
-                "cannot migrate a linked instance whose local endpoint requires provider {target_provider:?} while its definition resolves to {provider:?}"
-            ));
-        }
-        // Classification is based on the fully layered endpoint. Persist the
-        // resulting identity at the tier that owns provider resolution even
-        // when that tier previously inherited its provider. Without this, the
-        // rewrite is locally plausible but resolves back to the old provider
-        // after restart — precisely the kind of lie a one-shot marker makes
-        // permanent.
-        record.insert(
-            "provider".to_string(),
-            Value::String(target_provider.to_string()),
-        );
-        changed = true;
-    }
-    if target_provider != "openai" {
-        return Ok(changed);
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Identity {
+    Official,
+    Compatible,
+}
 
-    let Some(env_vars) = record.get_mut("env_vars").and_then(Value::as_object_mut) else {
-        return Ok(changed);
-    };
-    changed |= env_vars.remove(OPENAI_COMPAT_BASE_URL).is_some();
-    if env_vars.contains_key(OPENAI_API_KEY) {
-        return Ok(changed);
-    }
-    let Some(legacy_key) = env_vars.remove(OPENAI_COMPAT_API_KEY) else {
-        return Ok(changed);
-    };
-    env_vars.insert(OPENAI_API_KEY.to_string(), legacy_key);
-    Ok(true)
+type EnvLayer = (Owner, BTreeMap<String, String>);
+type SerializedStore = (Option<Vec<u8>>, Option<Vec<u8>>);
+
+#[derive(Clone, Debug)]
+struct ResolvedValue {
+    value: String,
+    owner: Owner,
 }
 
 #[derive(Clone, Debug)]
-struct DefinitionContext {
-    provider: Option<String>,
-    runtime: Option<String>,
-    env: Map<String, Value>,
+struct Consumer {
+    label: String,
+    record_index: usize,
+    provider: String,
+    provider_owner: Owner,
+    identity: Identity,
+    endpoint: Option<ResolvedValue>,
+    legacy_key: Option<ResolvedValue>,
+    official_key: Option<ResolvedValue>,
 }
 
-fn harness_env_for_runtime(
-    runtime: Option<&str>,
-    command_override_present: bool,
-    harnesses: &std::collections::HashMap<String, Map<String, Value>>,
-) -> Result<Map<String, Value>, String> {
-    let Some(runtime) = runtime.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(Map::new());
-    };
-    if let Some(env) = harnesses.get(runtime) {
-        return Ok(env.clone());
-    }
-    if command_override_present {
-        // Spawn accepts an explicit command before resolving the runtime. A
-        // deleted runtime then contributes no definition env rather than
-        // making the otherwise runnable record fail.
-        return Ok(Map::new());
-    }
-    if crate::managed_agents::custom_harnesses::check_id_collision(runtime).is_ok() {
-        return Err(format!("unresolved custom harness {runtime:?}"));
-    }
-    Ok(Map::new())
+#[derive(Clone, Debug)]
+struct Store {
+    global: GlobalAgentConfig,
+    records: Vec<ManagedAgentRecord>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct FileHashes {
+    source: Option<String>,
+    target: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TransactionManifest {
+    global: FileHashes,
+    managed: FileHashes,
+}
+
+#[derive(Clone)]
+struct PlannedStore {
+    global: Option<Vec<u8>>,
+    managed: Option<Vec<u8>>,
+    consumers: Vec<Consumer>,
+}
+
+fn hash(bytes: Option<&[u8]>) -> Option<String> {
+    bytes.map(|bytes| hex::encode(Sha256::digest(bytes)))
 }
 
 fn sibling_path(path: &Path, suffix: &str) -> PathBuf {
-    let file_name = path
+    let name = path
         .file_name()
-        .map(|name| name.to_string_lossy())
+        .map(|n| n.to_string_lossy())
         .unwrap_or_default();
-    crate::util::resolved_backup_path(path, &format!("{file_name}.{suffix}"))
+    crate::util::resolved_backup_path(path, &format!("{name}.{suffix}"))
 }
 
-// This migration is intentionally one-shot. After the split, a single config may
-// legitimately hold both credentials; reclassifying it on every boot would delete
-// a newly added compat key whenever its default provider is official OpenAI.
-fn migrate_openai_credentials_in_file(
-    path: &Path,
-    effective_provider: Option<&str>,
-    inherited_env_vars: Option<&Map<String, Value>>,
-    harnesses: &std::collections::HashMap<String, Map<String, Value>>,
-) -> Result<(), String> {
-    let marker_path = sibling_path(path, MIGRATION_SUFFIX);
-    if marker_path.exists() {
-        return Ok(());
-    }
+fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, String> {
     if !path.exists() {
-        // A later boot migration or sync step may still create this file with
-        // legacy bytes. Absence is not evidence that migration is complete.
-        return Ok(());
+        return Ok(None);
     }
+    std::fs::read(path)
+        .map(Some)
+        .map_err(|e| format!("failed to read {}: {e}", path.display()))
+}
 
-    let content = std::fs::read_to_string(path)
-        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
-    let mut root: Value = serde_json::from_str(&content)
-        .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
-    let changed = match &mut root {
-        Value::Array(records) => {
-            let definition_contexts = |records: &[Value]| {
-                records
-                    .iter()
-                    .filter_map(Value::as_object)
-                    .filter(|record| record.get("pubkey").and_then(Value::as_str) == Some(""))
-                    .filter_map(|record| {
-                        let slug = record.get("slug")?.as_str()?.to_string();
-                        let provider = record
-                            .get("provider")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned);
-                        let runtime = record
-                            .get("runtime")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned);
-                        let env = record
-                            .get("env_vars")
-                            .and_then(Value::as_object)
-                            .cloned()
-                            .unwrap_or_default();
-                        Some((
-                            slug,
-                            DefinitionContext {
-                                provider,
-                                runtime,
-                                env,
-                            },
-                        ))
-                    })
-                    .collect::<std::collections::HashMap<String, DefinitionContext>>()
-            };
-            let mut changed = false;
+fn parse_store(global: Option<&[u8]>, managed: Option<&[u8]>) -> Result<Store, String> {
+    let global = match global {
+        Some(bytes) => serde_json::from_slice(bytes)
+            .map_err(|e| format!("failed to parse global agent config: {e}"))?,
+        None => GlobalAgentConfig::default(),
+    };
+    let records = match managed {
+        Some(bytes) => serde_json::from_slice(bytes)
+            .map_err(|e| format!("failed to parse managed agent store: {e}"))?,
+        None => Vec::new(),
+    };
+    Ok(Store { global, records })
+}
 
-            // Provider ownership and env ownership are not the same graph.
-            // Definitions and standalone records own their provider tier, so
-            // migrate them first. Linked instances are definition-authoritative
-            // and must be evaluated only after those definitions have reached
-            // their persisted post-migration identity.
-            for record in records
-                .iter_mut()
-                .filter_map(Value::as_object_mut)
-                .filter(|record| record.get("persona_id").and_then(Value::as_str).is_none())
-            {
-                let local_provider = record
-                    .get("provider")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|provider| !provider.is_empty())
-                    .map(str::to_owned);
-                let resolved_provider = local_provider
-                    .as_deref()
-                    .or(effective_provider)
-                    .map(str::to_owned);
-                let selected_runtime = record
-                    .get("runtime")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|runtime| !runtime.is_empty());
-                let command_override_present = record
-                    .get("agent_command_override")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .is_some_and(|command| !command.is_empty());
-                let mut inherited_env =
-                    harness_env_for_runtime(selected_runtime, command_override_present, harnesses)?;
-                if let Some(global_env) = inherited_env_vars {
-                    inherited_env.extend(global_env.clone());
-                }
-                changed |= migrate_openai_credential_record(
-                    record,
-                    resolved_provider.as_deref(),
-                    (!inherited_env.is_empty()).then_some(&inherited_env),
-                    true,
-                )?;
+fn definitions(store: &Store) -> Vec<AgentDefinition> {
+    let mut defs: Vec<_> = store
+        .records
+        .iter()
+        .filter(|r| r.pubkey.is_empty())
+        .filter_map(ManagedAgentRecord::to_definition_view)
+        .collect();
+    for id in store.records.iter().filter_map(|r| r.persona_id.as_deref()) {
+        if !defs.iter().any(|d| d.id == id) {
+            if let Some(def) = crate::managed_agents::built_in_persona_definition(id, "") {
+                defs.push(def);
             }
+        }
+    }
+    defs
+}
 
-            let definitions = definition_contexts(records);
-            for record in records.iter_mut().filter_map(Value::as_object_mut) {
-                let Some(persona_id) = record.get("persona_id").and_then(Value::as_str) else {
-                    continue;
-                };
-                let definition = definitions
-                    .get(persona_id)
-                    .ok_or_else(|| format!("cannot resolve linked definition {persona_id:?}"))?;
-                let resolved_provider = definition
-                    .provider
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|provider| !provider.is_empty())
-                    .or(effective_provider);
-                let selected_runtime = record
-                    .get("runtime")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|runtime| !runtime.is_empty())
-                    .or_else(|| {
-                        definition
-                            .runtime
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|runtime| !runtime.is_empty())
-                    });
-                let command_override_present = record
-                    .get("agent_command_override")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .is_some_and(|command| !command.is_empty());
-                let mut inherited_env =
-                    harness_env_for_runtime(selected_runtime, command_override_present, harnesses)?;
-                if let Some(global_env) = inherited_env_vars {
-                    inherited_env.extend(global_env.clone());
-                }
-                inherited_env.extend(definition.env.clone());
-                changed |= migrate_openai_credential_record(
-                    record,
-                    resolved_provider,
-                    (!inherited_env.is_empty()).then_some(&inherited_env),
-                    false,
-                )?;
-            }
-            changed
+fn selected_definition<'a>(
+    record: &ManagedAgentRecord,
+    defs: &'a [AgentDefinition],
+) -> Option<&'a AgentDefinition> {
+    record
+        .persona_id
+        .as_deref()
+        .and_then(|id| defs.iter().find(|d| d.id == id))
+}
+
+fn runtime_id<'a>(
+    record: &'a ManagedAgentRecord,
+    def: Option<&'a AgentDefinition>,
+) -> Option<&'a str> {
+    record
+        .runtime
+        .as_deref()
+        .or_else(|| def.and_then(|d| d.runtime.as_deref()))
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+}
+
+fn layers(
+    store: &Store,
+    record: &ManagedAgentRecord,
+    def: Option<&AgentDefinition>,
+) -> Result<Vec<EnvLayer>, String> {
+    let mut result = vec![(Owner::Baked, crate::managed_agents::baked_build_env())];
+    if let Some(id) = runtime_id(record, def) {
+        if let Some(harness) =
+            crate::managed_agents::custom_harnesses::lookup_loaded_harness_by_id(id)
+        {
+            result.push((Owner::Harness(id.to_string()), harness.env.clone()));
+        } else if crate::managed_agents::known_acp_runtime_exact(id).is_none()
+            && record
+                .agent_command_override
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .is_none()
+        {
+            return Err(format!("unresolved custom harness {id:?}"));
         }
-        Value::Object(record) => {
-            migrate_openai_credential_record(record, effective_provider, inherited_env_vars, true)?
-        }
-        _ => {
+    }
+    result.push((Owner::Global, store.global.env_vars.clone()));
+    if let Some(def) = def {
+        let owner = store
+            .records
+            .iter()
+            .position(|r| r.pubkey.is_empty() && r.slug.as_deref() == Some(def.id.as_str()))
+            .map(Owner::Record)
+            .unwrap_or_else(|| Owner::BuiltinDefinition(def.id.clone()));
+        result.push((owner, def.env_vars.clone()));
+    }
+    result.push((
+        Owner::Record(
+            store
+                .records
+                .iter()
+                .position(|candidate| std::ptr::eq(candidate, record))
+                .ok_or("consumer record is not in store")?,
+        ),
+        record.env_vars.clone(),
+    ));
+    Ok(result)
+}
+
+fn resolve_key(layers: &[(Owner, BTreeMap<String, String>)], key: &str) -> Option<ResolvedValue> {
+    layers.iter().rev().find_map(|(owner, env)| {
+        env.get(key).map(|value| ResolvedValue {
+            value: value.clone(),
+            owner: owner.clone(),
+        })
+    })
+}
+
+fn classify_endpoint(endpoint: Option<&str>) -> Result<Identity, String> {
+    let Some(value) = endpoint.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(Identity::Official);
+    };
+    let url = url::Url::parse(value).map_err(|_| format!("invalid OpenAI endpoint {value:?}"))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(format!("invalid OpenAI endpoint {value:?}"));
+    }
+    let official = url.scheme() == "https"
+        && url
+            .host_str()
+            .is_some_and(|h| h.eq_ignore_ascii_case("api.openai.com"))
+        && url.port_or_known_default() == Some(443)
+        && matches!(url.path().trim_end_matches('/'), "" | "/v1");
+    Ok(if official {
+        Identity::Official
+    } else {
+        Identity::Compatible
+    })
+}
+
+fn collect_consumers(store: &Store) -> Result<Vec<Consumer>, String> {
+    let defs = definitions(store);
+    let mut consumers = Vec::new();
+    for (index, record) in store.records.iter().enumerate() {
+        let def = selected_definition(record, &defs);
+        if record.persona_id.is_some() && def.is_none() {
             return Err(format!(
-                "expected a JSON object or array in {}",
-                path.display()
+                "cannot resolve linked definition {:?}",
+                record.persona_id
             ));
         }
-    };
+        let effective = resolve_effective_config(record, &defs, &store.global);
+        let config = match effective {
+            EffectiveConfigResult::Resolved(config) => config,
+            EffectiveConfigResult::OrphanedInstance {
+                missing_persona_id, ..
+            } => {
+                return Err(format!(
+                    "cannot resolve linked definition {missing_persona_id:?}"
+                ))
+            }
+        };
+        let Some(provider) = config
+            .provider
+            .value
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        else {
+            continue;
+        };
+        if !matches!(
+            provider.to_ascii_lowercase().as_str(),
+            "openai" | "openai-compat"
+        ) {
+            continue;
+        }
+        let provider_owner = match config.provider.source {
+            ConfigSource::Global => Owner::Global,
+            ConfigSource::Definition => {
+                let id = record
+                    .persona_id
+                    .as_deref()
+                    .or(record.slug.as_deref())
+                    .ok_or("definition provider has no owner")?;
+                store
+                    .records
+                    .iter()
+                    .position(|r| r.pubkey.is_empty() && r.slug.as_deref() == Some(id))
+                    .map(Owner::Record)
+                    .unwrap_or_else(|| Owner::BuiltinDefinition(id.to_string()))
+            }
+            ConfigSource::InstanceLegacy => Owner::Record(index),
+        };
+        let resolved_layers = layers(store, record, def)?;
+        let endpoint = resolve_key(&resolved_layers, OPENAI_COMPAT_BASE_URL);
+        let identity = classify_endpoint(endpoint.as_ref().map(|v| v.value.as_str()))?;
+        consumers.push(Consumer {
+            label: record
+                .slug
+                .clone()
+                .or_else(|| (!record.pubkey.is_empty()).then(|| record.pubkey.clone()))
+                .unwrap_or_else(|| format!("record-{index}")),
+            record_index: index,
+            provider: provider.to_ascii_lowercase(),
+            provider_owner,
+            identity,
+            endpoint,
+            legacy_key: resolve_key(&resolved_layers, OPENAI_COMPAT_API_KEY),
+            official_key: resolve_key(&resolved_layers, OPENAI_API_KEY),
+        });
+    }
+    Ok(consumers)
+}
 
-    if changed {
-        let backup_path = sibling_path(path, BACKUP_SUFFIX);
-        crate::util::create_restricted_backup_once(&backup_path, content.as_bytes())
-            .map_err(|error| format!("failed to back up {}: {error}", path.display()))?;
-        let bytes = serde_json::to_vec_pretty(&root)
-            .map_err(|error| format!("failed to serialize {}: {error}", path.display()))?;
-        crate::managed_agents::atomic_write_json_restricted(path, &bytes)?;
+fn env_mut(store: &mut Store, owner: Owner) -> Result<&mut BTreeMap<String, String>, String> {
+    match owner {
+        Owner::Global => Ok(&mut store.global.env_vars),
+        Owner::Record(i) => Ok(&mut store
+            .records
+            .get_mut(i)
+            .ok_or("record owner is missing")?
+            .env_vars),
+        Owner::Baked | Owner::Harness(_) | Owner::BuiltinDefinition(_) => {
+            Err("required mutation is owned by a read-only harness/build layer".into())
+        }
+    }
+}
+
+fn set_provider(store: &mut Store, owner: Owner, provider: &str) -> Result<(), String> {
+    match owner {
+        Owner::Global => {
+            store.global.provider = Some(provider.into());
+            Ok(())
+        }
+        Owner::Record(i) => {
+            store
+                .records
+                .get_mut(i)
+                .ok_or("record owner is missing")?
+                .provider = Some(provider.into());
+            Ok(())
+        }
+        Owner::Baked | Owner::Harness(_) | Owner::BuiltinDefinition(_) => {
+            Err("required provider mutation is read-only".into())
+        }
+    }
+}
+
+fn plan_store(mut store: Store) -> Result<(Store, Vec<Consumer>), String> {
+    let consumers = collect_consumers(&store)?;
+    let all_env_consumers: Vec<_> = store
+        .records
+        .iter()
+        .enumerate()
+        .map(|(index, record)| {
+            let defs = definitions(&store);
+            let def = selected_definition(record, &defs);
+            layers(&store, record, def).map(|layers| {
+                (
+                    index,
+                    resolve_key(&layers, OPENAI_COMPAT_API_KEY),
+                    resolve_key(&layers, OPENAI_API_KEY),
+                    resolve_key(&layers, OPENAI_COMPAT_BASE_URL),
+                )
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    let mut provider_targets: HashMap<Owner, (Identity, bool)> = HashMap::new();
+    for consumer in &consumers {
+        let expected = if consumer.identity == Identity::Official {
+            "openai"
+        } else {
+            "openai-compat"
+        };
+        match provider_targets.entry(consumer.provider_owner.clone()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert((consumer.identity, consumer.provider != expected));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if entry.get().0 != consumer.identity {
+                    return Err(format!(
+                        "provider owner {:?} feeds mixed official/custom consumers",
+                        consumer.provider_owner
+                    ));
+                }
+                entry.get_mut().1 |= consumer.provider != expected;
+            }
+        }
+    }
+    for (owner, (identity, needs_change)) in provider_targets {
+        if needs_change {
+            set_provider(
+                &mut store,
+                owner,
+                if identity == Identity::Official {
+                    "openai"
+                } else {
+                    "openai-compat"
+                },
+            )?;
+        }
     }
 
-    crate::managed_agents::atomic_write_json_restricted(&marker_path, b"1\n")
+    let mut legacy_targets: HashMap<Owner, Identity> = HashMap::new();
+    for consumer in &consumers {
+        if consumer.identity == Identity::Official
+            && consumer
+                .official_key
+                .as_ref()
+                .is_some_and(|v| !v.value.is_empty())
+        {
+            continue;
+        }
+        let Some(legacy) = &consumer.legacy_key else {
+            continue;
+        };
+        if let Some(previous) = legacy_targets.insert(legacy.owner.clone(), consumer.identity) {
+            if previous != consumer.identity {
+                return Err(format!(
+                    "credential owner {:?} feeds mixed official/custom consumers",
+                    legacy.owner
+                ));
+            }
+        }
+    }
+    for (owner, identity) in legacy_targets {
+        if identity == Identity::Official {
+            for (index, legacy, official, _) in &all_env_consumers {
+                if legacy.as_ref().is_some_and(|value| value.owner == owner) {
+                    let relevant = consumers
+                        .iter()
+                        .find(|consumer| consumer.record_index == *index);
+                    if relevant.is_none_or(|consumer| consumer.identity != Identity::Official) {
+                        return Err(format!(
+                            "credential owner {owner:?} is shared with a non-official consumer"
+                        ));
+                    }
+                    if official
+                        .as_ref()
+                        .is_some_and(|value| !value.value.is_empty())
+                    {
+                        return Err(format!(
+                            "credential owner {owner:?} is also visible beside an existing distinct official credential"
+                        ));
+                    }
+                }
+            }
+            let env = env_mut(&mut store, owner)?;
+            if env.get(OPENAI_API_KEY).is_none_or(|value| value.is_empty()) {
+                if let Some(value) = env.remove(OPENAI_COMPAT_API_KEY) {
+                    env.insert(OPENAI_API_KEY.into(), value);
+                }
+            }
+        }
+    }
+
+    // Official aliases and inherited custom origins must be shadowed with the one
+    // spelling accepted by both readiness and buzz-agent. Plan this by the
+    // shared endpoint owner: changing a lower alias is forbidden when it also
+    // routes a custom/non-OpenAI consumer.
+    let mut alias_owners = Vec::new();
+    for consumer in &consumers {
+        if consumer.identity != Identity::Official {
+            continue;
+        }
+        if let Some(endpoint) = &consumer.endpoint {
+            if endpoint.value.trim().trim_end_matches('/') != CANONICAL_OPENAI_ORIGIN {
+                alias_owners.push(endpoint.owner.clone());
+            }
+        }
+    }
+    alias_owners.sort_by_key(|owner| format!("{owner:?}"));
+    alias_owners.dedup();
+    for owner in alias_owners {
+        for (index, _, _, endpoint) in &all_env_consumers {
+            if endpoint.as_ref().is_some_and(|value| value.owner == owner) {
+                let relevant = consumers
+                    .iter()
+                    .find(|consumer| consumer.record_index == *index);
+                if relevant.is_none_or(|consumer| consumer.identity != Identity::Official) {
+                    return Err(format!(
+                        "endpoint owner {owner:?} is shared with a non-official consumer"
+                    ));
+                }
+            }
+        }
+        env_mut(&mut store, owner)?.insert(
+            OPENAI_COMPAT_BASE_URL.into(),
+            CANONICAL_OPENAI_ORIGIN.into(),
+        );
+    }
+
+    // A canonical local endpoint may be the only thing hiding a lower custom
+    // route. Removing it would make official OpenAI fail closed after restart,
+    // so leave every already-canonical shadow intact.
+    Ok((store, consumers))
+}
+
+fn serialize_store(
+    store: &Store,
+    source_global: Option<&[u8]>,
+    source_managed: Option<&[u8]>,
+) -> Result<SerializedStore, String> {
+    let global = if source_global.is_some() || store.global != GlobalAgentConfig::default() {
+        Some(serde_json::to_vec_pretty(&store.global).map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
+    let managed = if source_managed.is_some() || !store.records.is_empty() {
+        Some(serde_json::to_vec_pretty(&store.records).map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
+    Ok((global, managed))
+}
+
+fn verify_post_split(before: &[Consumer], after: &Store) -> Result<(), String> {
+    let post = collect_consumers(after)?;
+    let defs = definitions(after);
+    for old in before {
+        let new = post
+            .iter()
+            .find(|c| c.record_index == old.record_index)
+            .ok_or_else(|| format!("consumer {:?} disappeared", old.label))?;
+        if new.identity != old.identity {
+            return Err(format!(
+                "consumer {:?} changed endpoint identity",
+                old.label
+            ));
+        }
+        let expected_provider = if old.identity == Identity::Official {
+            "openai"
+        } else {
+            "openai-compat"
+        };
+        let config = match resolve_effective_config(
+            &after.records[old.record_index],
+            &defs,
+            &after.global,
+        ) {
+            EffectiveConfigResult::Resolved(c) => c,
+            _ => return Err(format!("consumer {:?} became unresolved", old.label)),
+        };
+        if config.provider.value.as_deref() != Some(expected_provider) {
+            return Err(format!(
+                "consumer {:?} resolves provider {:?}, expected {expected_provider}",
+                old.label, config.provider.value
+            ));
+        }
+        let descriptor = crate::managed_agents::resolve_effective_harness_descriptor(
+            &after.records[old.record_index],
+            &defs,
+            &after.global,
+        )
+        .map_err(|e| format!("consumer {:?} harness resolution failed: {e}", old.label))?;
+        let old_selected = if old.provider == "openai" {
+            old.official_key.as_ref().or(old.legacy_key.as_ref())
+        } else {
+            old.legacy_key.as_ref()
+        };
+        let effective = crate::managed_agents::resolve_effective_agent_env(
+            &after.records[old.record_index],
+            &defs,
+            crate::managed_agents::known_acp_runtime(&descriptor.command),
+            &after.global,
+        );
+        let readiness = crate::managed_agents::agent_readiness(&effective);
+        let readiness_failure = match &readiness {
+            crate::managed_agents::AgentReadiness::Ready => false,
+            crate::managed_agents::AgentReadiness::NotReady { requirements } => {
+                requirements.iter().any(|requirement| match requirement {
+                    crate::managed_agents::Requirement::ConfigInvalid { .. } => true,
+                    crate::managed_agents::Requirement::EnvKey { key } => {
+                        key == if old.identity == Identity::Official {
+                            OPENAI_API_KEY
+                        } else {
+                            OPENAI_COMPAT_BASE_URL
+                        }
+                    }
+                    _ => false,
+                })
+            }
+        };
+        if old_selected.is_some() && readiness_failure {
+            return Err(format!(
+                "consumer {:?} fails post-split readiness",
+                old.label
+            ));
+        }
+        let selected = if old.identity == Identity::Official {
+            descriptor.env.get(OPENAI_API_KEY)
+        } else {
+            descriptor.env.get(OPENAI_COMPAT_API_KEY)
+        };
+        let expected = if old.identity == Identity::Official {
+            old.official_key
+                .as_ref()
+                .filter(|v| !v.value.is_empty())
+                .or(old.legacy_key.as_ref())
+                .map(|v| &v.value)
+        } else {
+            old.legacy_key.as_ref().map(|v| &v.value)
+        };
+        if old_selected.is_some() && selected != expected {
+            return Err(format!(
+                "consumer {:?} changed selected credential",
+                old.label
+            ));
+        }
+        if old.identity == Identity::Official {
+            let origin = descriptor
+                .env
+                .get(OPENAI_COMPAT_BASE_URL)
+                .map(String::as_str);
+            if origin.is_some_and(|v| v.trim().trim_end_matches('/') != CANONICAL_OPENAI_ORIGIN) {
+                return Err(format!(
+                    "consumer {:?} retains rejected official origin",
+                    old.label
+                ));
+            }
+        } else if classify_endpoint(
+            descriptor
+                .env
+                .get(OPENAI_COMPAT_BASE_URL)
+                .map(String::as_str),
+        )? != Identity::Compatible
+        {
+            return Err(format!("consumer {:?} lost its custom origin", old.label));
+        }
+    }
+    Ok(())
+}
+
+fn make_plan(global: Option<&[u8]>, managed: Option<&[u8]>) -> Result<PlannedStore, String> {
+    let source = parse_store(global, managed)?;
+    let (store, consumers) = plan_store(source)?;
+    verify_post_split(&consumers, &store)?;
+    let (global, managed) = serialize_store(&store, global, managed)?;
+    Ok(PlannedStore {
+        global,
+        managed,
+        consumers,
+    })
+}
+
+fn current_hash(path: &Path) -> Result<Option<String>, String> {
+    Ok(hash(read_optional(path)?.as_deref()))
+}
+
+fn apply_target(path: &Path, target: Option<&[u8]>) -> Result<(), String> {
+    match target {
+        Some(bytes) => crate::managed_agents::atomic_write_json_restricted(path, bytes),
+        None if path.exists() => std::fs::remove_file(path)
+            .map_err(|e| format!("failed to remove {}: {e}", path.display())),
+        None => Ok(()),
+    }
+}
+
+fn verify_written_targets(
+    expected: &TransactionManifest,
+    consumers: &[Consumer],
+    global: Option<&[u8]>,
+    managed: Option<&[u8]>,
+) -> Result<(), String> {
+    if hash(global) != expected.global.target || hash(managed) != expected.managed.target {
+        return Err("migration target hash mismatch after write".into());
+    }
+    let reread = parse_store(global, managed)?;
+    verify_post_split(consumers, &reread)
+}
+
+fn migrate_pair(agents_dir: &Path) -> Result<(), String> {
+    let marker = agents_dir.join(MARKER_FILE);
+    if marker.is_file()
+        && std::fs::read(&marker)
+            .ok()
+            .as_deref()
+            .is_some_and(|bytes| bytes == b"1\n")
+    {
+        return Ok(());
+    }
+    let global_path = agents_dir.join("global-agent-config.json");
+    let managed_path = agents_dir.join("managed-agents.json");
+    let manifest_path = agents_dir.join(MANIFEST_FILE);
+
+    let (source_global, source_managed, manifest) = if manifest_path.exists() {
+        let manifest: TransactionManifest =
+            serde_json::from_slice(&std::fs::read(&manifest_path).map_err(|e| e.to_string())?)
+                .map_err(|e| format!("invalid migration manifest: {e}"))?;
+        for (path, hashes) in [
+            (&global_path, &manifest.global),
+            (&managed_path, &manifest.managed),
+        ] {
+            let current = current_hash(path)?;
+            if current != hashes.source && current != hashes.target {
+                return Err(format!(
+                    "external edit detected during OpenAI credential migration: {}",
+                    path.display()
+                ));
+            }
+        }
+        let source_global = if manifest.global.source.is_some() {
+            read_optional(&sibling_path(&global_path, BACKUP_SUFFIX))?
+        } else {
+            None
+        };
+        let source_managed = if manifest.managed.source.is_some() {
+            read_optional(&sibling_path(&managed_path, BACKUP_SUFFIX))?
+        } else {
+            None
+        };
+        (source_global, source_managed, Some(manifest))
+    } else {
+        (
+            read_optional(&global_path)?,
+            read_optional(&managed_path)?,
+            None,
+        )
+    };
+    if source_global.is_none() && source_managed.is_none() {
+        return Ok(());
+    }
+    let plan = make_plan(source_global.as_deref(), source_managed.as_deref())?;
+    let expected = TransactionManifest {
+        global: FileHashes {
+            source: hash(source_global.as_deref()),
+            target: hash(plan.global.as_deref()),
+        },
+        managed: FileHashes {
+            source: hash(source_managed.as_deref()),
+            target: hash(plan.managed.as_deref()),
+        },
+    };
+    if let Some(existing) = manifest {
+        if existing.global.source != expected.global.source
+            || existing.global.target != expected.global.target
+            || existing.managed.source != expected.managed.source
+            || existing.managed.target != expected.managed.target
+        {
+            return Err("migration manifest does not match pristine backups".into());
+        }
+    } else {
+        if let Some(bytes) = &source_global {
+            let backup_path = sibling_path(&global_path, BACKUP_SUFFIX);
+            crate::util::create_restricted_backup_once(&backup_path, bytes)
+                .map_err(|e| e.to_string())?;
+            if read_optional(&backup_path)?.as_deref() != Some(bytes.as_slice()) {
+                return Err(format!(
+                    "existing migration backup does not match pristine source: {}",
+                    backup_path.display()
+                ));
+            }
+        }
+        if let Some(bytes) = &source_managed {
+            let backup_path = sibling_path(&managed_path, BACKUP_SUFFIX);
+            crate::util::create_restricted_backup_once(&backup_path, bytes)
+                .map_err(|e| e.to_string())?;
+            if read_optional(&backup_path)?.as_deref() != Some(bytes.as_slice()) {
+                return Err(format!(
+                    "existing migration backup does not match pristine source: {}",
+                    backup_path.display()
+                ));
+            }
+        }
+        let bytes = serde_json::to_vec_pretty(&expected).map_err(|e| e.to_string())?;
+        crate::managed_agents::atomic_write_json_restricted(&manifest_path, &bytes)?;
+    }
+    if current_hash(&global_path)? == expected.global.source {
+        apply_target(&global_path, plan.global.as_deref())?;
+    }
+    if current_hash(&managed_path)? == expected.managed.source {
+        apply_target(&managed_path, plan.managed.as_deref())?;
+    }
+    let reread_global = read_optional(&global_path)?;
+    let reread_managed = read_optional(&managed_path)?;
+    verify_written_targets(
+        &expected,
+        &plan.consumers,
+        reread_global.as_deref(),
+        reread_managed.as_deref(),
+    )?;
+    crate::managed_agents::atomic_write_json_restricted(&marker, b"1\n")
 }
 
 pub(super) fn migrate_openai_credentials(app: &tauri::AppHandle) {
     let Ok(agents_dir) = crate::managed_agents::managed_agents_base_dir(app) else {
         return;
     };
-    let custom_harnesses_dir = agents_dir
-        .parent()
-        .map(|path| path.join("custom_harnesses"));
-    let mut harness_definitions = crate::managed_agents::preset_harness_definitions();
-    harness_definitions.extend(
-        custom_harnesses_dir
-            .as_deref()
-            .map(crate::managed_agents::custom_harnesses::load_custom_harnesses)
-            .unwrap_or_default(),
-    );
-    let harnesses: std::collections::HashMap<String, Map<String, Value>> = harness_definitions
-        .into_iter()
-        .map(|definition| {
-            let env = definition
-                .env
-                .into_iter()
-                .map(|(key, value)| (key, Value::String(value)))
-                .collect();
-            (definition.id, env)
-        })
-        .collect();
-    let global_path = agents_dir.join("global-agent-config.json");
-    if let Err(error) = migrate_openai_credentials_in_file(&global_path, None, None, &harnesses) {
-        eprintln!("buzz-desktop: openai-credential-migration: {error}");
-    }
-
-    // Agent and definition records inherit the global env floor. Classification
-    // must use that effective endpoint when a record does not override it;
-    // otherwise an `openai` definition inheriting a custom global origin would
-    // be silently relabeled as official OpenAI and stop working.
-    let global = std::fs::read_to_string(&global_path)
-        .ok()
-        .and_then(|content| serde_json::from_str::<Value>(&content).ok());
-    let global_provider = global
-        .as_ref()
-        .and_then(|root| root.get("provider"))
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let global_env = global
-        .as_ref()
-        .and_then(|root| root.get("env_vars"))
-        .and_then(Value::as_object)
-        .cloned();
-    let managed_path = agents_dir.join("managed-agents.json");
-    if let Err(error) = migrate_openai_credentials_in_file(
-        &managed_path,
-        global_provider.as_deref(),
-        global_env.as_ref(),
-        &harnesses,
-    ) {
+    let custom_dir = agents_dir.parent().map(|p| p.join("custom_harnesses"));
+    crate::managed_agents::custom_harnesses::warm_harness_registry_from_dir(custom_dir.as_deref());
+    if let Err(error) = migrate_pair(&agents_dir) {
         eprintln!("buzz-desktop: openai-credential-migration: {error}");
     }
 }

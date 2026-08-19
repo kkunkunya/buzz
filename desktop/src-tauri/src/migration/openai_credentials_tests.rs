@@ -1,711 +1,486 @@
 use super::*;
-fn custom_gateway_harnesses() -> std::collections::HashMap<String, Map<String, Value>> {
-    std::collections::HashMap::from([(
-        "custom-gateway".to_string(),
-        serde_json::json!({
-            "OPENAI_COMPAT_BASE_URL": "https://gateway.example/v1"
-        })
-        .as_object()
-        .unwrap()
-        .clone(),
-    )])
-}
 
-fn migrate_file(
-    path: &Path,
-    effective_provider: Option<&str>,
-    inherited_env_vars: Option<&Map<String, Value>>,
-) -> Result<(), String> {
-    migrate_openai_credentials_in_file(
-        path,
-        effective_provider,
-        inherited_env_vars,
-        &std::collections::HashMap::new(),
-    )
-}
-
-fn migrate(value: Value) -> (Value, bool) {
-    let mut record = value.as_object().unwrap().clone();
-    let changed = migrate_openai_credential_record(&mut record, None, None, true).unwrap();
-    (Value::Object(record), changed)
-}
-
-#[test]
-fn official_openai_renames_the_legacy_credential_and_removes_routing_state() {
-    let (record, changed) = migrate(serde_json::json!({
-        "provider": "openai",
-        "env_vars": {
-            "OPENAI_COMPAT_API_KEY": "official-secret",
-            "OPENAI_COMPAT_BASE_URL": "https://api.openai.com/v1",
-            "KEEP": "value"
-        }
-    }));
-
-    assert!(changed);
-    assert_eq!(record["env_vars"][OPENAI_API_KEY], "official-secret");
-    assert!(record["env_vars"].get(OPENAI_COMPAT_API_KEY).is_none());
-    assert!(record["env_vars"].get(OPENAI_COMPAT_BASE_URL).is_none());
-    assert_eq!(record["env_vars"]["KEEP"], "value");
-}
-
-#[test]
-fn custom_endpoint_stays_openai_compat_with_its_credential() {
-    let original = serde_json::json!({
-        "provider": "openai-compat",
-        "env_vars": {
-            "OPENAI_COMPAT_API_KEY": "compat-secret",
-            "OPENAI_COMPAT_BASE_URL": "https://gateway.example/v1"
-        }
-    });
-    let (record, changed) = migrate(original.clone());
-
-    assert!(!changed);
-    assert_eq!(record, original);
-}
-
-#[test]
-fn legacy_openai_custom_endpoint_becomes_openai_compat() {
-    let (record, changed) = migrate(serde_json::json!({
-        "provider": "openai",
-        "env_vars": {
-            "OPENAI_COMPAT_API_KEY": "compat-secret",
-            "OPENAI_COMPAT_BASE_URL": "http://localhost:11434/v1"
-        }
-    }));
-
-    assert!(changed);
-    assert_eq!(record["provider"], "openai-compat");
-    assert_eq!(record["env_vars"][OPENAI_COMPAT_API_KEY], "compat-secret");
-    assert!(record["env_vars"].get(OPENAI_API_KEY).is_none());
-}
-
-#[test]
-fn non_api_openai_subdomain_is_still_a_compat_endpoint() {
-    let (record, changed) = migrate(serde_json::json!({
-        "provider": "openai",
-        "env_vars": {
-            "OPENAI_COMPAT_API_KEY": "compat-secret",
-            "OPENAI_COMPAT_BASE_URL": "https://gateway.openai.com/v1"
-        }
-    }));
-
-    assert!(changed);
-    assert_eq!(record["provider"], "openai-compat");
-    assert_eq!(record["env_vars"][OPENAI_COMPAT_API_KEY], "compat-secret");
-}
-
-#[test]
-fn non_api_path_on_openai_host_is_still_a_compat_endpoint() {
-    let (record, changed) = migrate(serde_json::json!({
-        "provider": "openai",
-        "env_vars": {
-            "OPENAI_COMPAT_API_KEY": "compat-secret",
-            "OPENAI_COMPAT_BASE_URL": "https://api.openai.com/proxy/v1"
-        }
-    }));
-
-    assert!(changed);
-    assert_eq!(record["provider"], "openai-compat");
-    assert_eq!(record["env_vars"][OPENAI_COMPAT_API_KEY], "compat-secret");
-    assert!(record["env_vars"].get(OPENAI_API_KEY).is_none());
-}
-
-#[test]
-fn legacy_openai_compat_without_custom_endpoint_becomes_official() {
-    let (record, changed) = migrate(serde_json::json!({
-        "provider": "openai-compat",
-        "env_vars": { "OPENAI_COMPAT_API_KEY": "official-secret" }
-    }));
-
-    assert!(changed);
-    assert_eq!(record["provider"], "openai");
-    assert_eq!(record["env_vars"][OPENAI_API_KEY], "official-secret");
-    assert!(record["env_vars"].get(OPENAI_COMPAT_API_KEY).is_none());
-}
-
-#[test]
-fn existing_distinct_credentials_are_both_preserved() {
-    let original = serde_json::json!({
-        "provider": "openai",
-        "env_vars": {
-            "OPENAI_API_KEY": "official-secret",
-            "OPENAI_COMPAT_API_KEY": "compat-secret"
-        }
-    });
-    let (record, changed) = migrate(original.clone());
-
-    assert!(!changed);
-    assert_eq!(record, original);
-}
-
-#[test]
-fn providerless_record_is_not_guessed() {
-    let original = serde_json::json!({
-        "env_vars": { "OPENAI_COMPAT_API_KEY": "ambiguous-secret" }
-    });
-    let (record, changed) = migrate(original.clone());
-
-    assert!(!changed);
-    assert_eq!(record, original);
-}
-
-#[test]
-fn record_inherits_custom_global_endpoint_for_classification() {
-    let inherited_env = serde_json::json!({
-        "OPENAI_COMPAT_BASE_URL": "https://gateway.example/v1"
-    });
-    let mut record = serde_json::json!({
-        "provider": "openai",
-        "env_vars": { "OPENAI_COMPAT_API_KEY": "compat-secret" }
-    })
-    .as_object()
+fn record(pubkey: &str, name: &str) -> ManagedAgentRecord {
+    serde_json::from_value(serde_json::json!({
+        "pubkey": pubkey,
+        "name": name,
+        "relay_url": "wss://relay.example",
+        "acp_command": "buzz-acp",
+        "agent_command": "buzz-agent",
+        "agent_args": [],
+        "mcp_command": "",
+        "turn_timeout_seconds": 320,
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z"
+    }))
     .unwrap()
-    .clone();
+}
 
-    let changed =
-        migrate_openai_credential_record(&mut record, None, inherited_env.as_object(), true)
-            .unwrap();
+fn definition(id: &str) -> ManagedAgentRecord {
+    let mut value = record("", id);
+    value.slug = Some(id.to_string());
+    value.display_name = Some(id.to_string());
+    value.system_prompt = Some(String::new());
+    value
+}
 
-    assert!(changed);
-    assert_eq!(record["provider"], "openai-compat");
-    assert_eq!(record["env_vars"][OPENAI_COMPAT_API_KEY], "compat-secret");
-    assert!(record["env_vars"].get(OPENAI_API_KEY).is_none());
+fn planned(global: GlobalAgentConfig, records: Vec<ManagedAgentRecord>) -> Result<Store, String> {
+    plan_store(Store { global, records }).map(|(store, _)| store)
 }
 
 #[test]
-fn local_endpoint_override_wins_over_inherited_endpoint() {
-    let inherited_env = serde_json::json!({
-        "OPENAI_COMPAT_BASE_URL": "https://gateway.example/v1"
-    });
-    let mut record = serde_json::json!({
-        "provider": "openai",
-        "env_vars": {
-            "OPENAI_COMPAT_API_KEY": "official-secret",
-            "OPENAI_COMPAT_BASE_URL": "https://api.openai.com/v1"
+fn whole_store_matrix_classifies_origins_and_moves_only_official_credentials() {
+    for (origin, expected_provider, expected_key) in [
+        (None, "openai", OPENAI_API_KEY),
+        (Some("https://api.openai.com/v1"), "openai", OPENAI_API_KEY),
+        (Some("https://api.openai.com"), "openai", OPENAI_API_KEY),
+        (
+            Some("http://localhost:11434/v1"),
+            "openai-compat",
+            OPENAI_COMPAT_API_KEY,
+        ),
+    ] {
+        let mut agent = record("agent", "agent");
+        agent.provider = Some("openai".into());
+        agent
+            .env_vars
+            .insert(OPENAI_COMPAT_API_KEY.into(), "secret".into());
+        if let Some(origin) = origin {
+            agent
+                .env_vars
+                .insert(OPENAI_COMPAT_BASE_URL.into(), origin.into());
         }
-    })
-    .as_object()
-    .unwrap()
-    .clone();
 
-    let changed =
-        migrate_openai_credential_record(&mut record, None, inherited_env.as_object(), true)
-            .unwrap();
-
-    assert!(changed);
-    assert_eq!(record["provider"], "openai");
-    assert_eq!(record["env_vars"][OPENAI_API_KEY], "official-secret");
-}
-
-#[test]
-fn credentialed_openai_host_is_not_classified_as_official() {
-    let (record, changed) = migrate(serde_json::json!({
-        "provider": "openai",
-        "env_vars": {
-            "OPENAI_COMPAT_API_KEY": "compat-secret",
-            "OPENAI_COMPAT_BASE_URL": "https://attacker@example.com@api.openai.com/v1"
+        let store = planned(GlobalAgentConfig::default(), vec![agent]).unwrap();
+        assert_eq!(
+            store.records[0].provider.as_deref(),
+            Some(expected_provider)
+        );
+        assert_eq!(
+            store.records[0]
+                .env_vars
+                .get(expected_key)
+                .map(String::as_str),
+            Some("secret")
+        );
+        if expected_provider == "openai" && origin.is_some() {
+            assert_eq!(
+                store.records[0]
+                    .env_vars
+                    .get(OPENAI_COMPAT_BASE_URL)
+                    .map(String::as_str),
+                Some(CANONICAL_OPENAI_ORIGIN)
+            );
         }
-    }));
-
-    assert!(changed);
-    assert_eq!(record["provider"], "openai-compat");
-    assert_eq!(record["env_vars"][OPENAI_COMPAT_API_KEY], "compat-secret");
+    }
 }
 
 #[test]
-fn custom_harness_origin_prevents_official_credential_relabeling() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("managed-agents.json");
-    std::fs::write(
-        &path,
-        serde_json::to_vec(&serde_json::json!([{
-            "pubkey": "",
-            "slug": "custom-definition",
-            "runtime": "custom-gateway",
-            "provider": "openai",
-            "env_vars": { "OPENAI_COMPAT_API_KEY": "compat-secret" }
-        }]))
-        .unwrap(),
-    )
-    .unwrap();
-    let harnesses = custom_gateway_harnesses();
+fn malformed_origin_fails_before_mutation() {
+    let mut agent = record("agent", "agent");
+    agent.provider = Some("openai".into());
+    agent
+        .env_vars
+        .insert(OPENAI_COMPAT_BASE_URL.into(), "not a url".into());
+    assert!(planned(GlobalAgentConfig::default(), vec![agent])
+        .unwrap_err()
+        .contains("invalid OpenAI endpoint"));
+}
 
-    migrate_openai_credentials_in_file(&path, None, None, &harnesses).unwrap();
-    let records: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-
-    assert_eq!(records[0]["provider"], "openai-compat");
+#[test]
+fn existing_official_key_wins_without_copying_legacy_secret() {
+    let mut agent = record("agent", "agent");
+    agent.provider = Some("openai".into());
+    agent
+        .env_vars
+        .insert(OPENAI_API_KEY.into(), "official".into());
+    agent
+        .env_vars
+        .insert(OPENAI_COMPAT_API_KEY.into(), "compat".into());
+    let store = planned(GlobalAgentConfig::default(), vec![agent]).unwrap();
     assert_eq!(
-        records[0]["env_vars"][OPENAI_COMPAT_API_KEY],
-        "compat-secret"
-    );
-    assert!(records[0]["env_vars"].get(OPENAI_API_KEY).is_none());
-}
-
-#[test]
-fn unresolved_custom_harness_leaves_file_unmarked() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("managed-agents.json");
-    let original = serde_json::to_vec(&serde_json::json!([{
-        "pubkey": "",
-        "slug": "custom-definition",
-        "runtime": "missing-custom-harness",
-        "provider": "openai",
-        "env_vars": { "OPENAI_COMPAT_API_KEY": "compat-secret" }
-    }]))
-    .unwrap();
-    std::fs::write(&path, &original).unwrap();
-
-    let error =
-        migrate_openai_credentials_in_file(&path, None, None, &std::collections::HashMap::new())
-            .unwrap_err();
-
-    assert!(error.contains("unresolved custom harness"), "{error}");
-    assert_eq!(std::fs::read(&path).unwrap(), original);
-    assert!(!sibling_path(&path, MIGRATION_SUFFIX).exists());
-}
-
-#[test]
-fn raw_command_override_does_not_block_runtime_less_record_migration() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("managed-agents.json");
-    std::fs::write(
-        &path,
-        serde_json::to_vec(&serde_json::json!([{
-            "pubkey": "agent-pubkey",
-            "agent_command_override": "/opt/custom/my-agent",
-            "provider": "openai",
-            "env_vars": { "OPENAI_COMPAT_API_KEY": "official-secret" }
-        }]))
-        .unwrap(),
-    )
-    .unwrap();
-
-    migrate_openai_credentials_in_file(&path, None, None, &std::collections::HashMap::new())
-        .unwrap();
-    let records: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-
-    assert_eq!(records[0]["env_vars"][OPENAI_API_KEY], "official-secret");
-    assert!(sibling_path(&path, MIGRATION_SUFFIX).exists());
-}
-
-#[test]
-fn raw_command_override_allows_migration_past_dangling_runtime() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("managed-agents.json");
-    std::fs::write(
-        &path,
-        serde_json::to_vec(&serde_json::json!([
-            {
-                "pubkey": "overridden-agent",
-                "runtime": "missing-custom-harness",
-                "agent_command_override": "/opt/custom/my-agent",
-                "provider": "openai",
-                "env_vars": { "OPENAI_COMPAT_API_KEY": "overridden-secret" }
-            },
-            {
-                "pubkey": "unrelated-agent",
-                "provider": "openai",
-                "env_vars": { "OPENAI_COMPAT_API_KEY": "unrelated-secret" }
-            }
-        ]))
-        .unwrap(),
-    )
-    .unwrap();
-
-    migrate_openai_credentials_in_file(&path, None, None, &std::collections::HashMap::new())
-        .unwrap();
-    let records: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-
-    assert_eq!(records[0]["env_vars"][OPENAI_API_KEY], "overridden-secret");
-    assert_eq!(records[1]["env_vars"][OPENAI_API_KEY], "unrelated-secret");
-    assert!(sibling_path(&path, MIGRATION_SUFFIX).exists());
-}
-
-#[test]
-fn global_credentials_ignore_preferred_runtime_harness_env() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("global-agent-config.json");
-    std::fs::write(
-        &path,
-        serde_json::to_vec(&serde_json::json!({
-            "preferred_runtime": "custom-gateway",
-            "provider": "openai",
-            "env_vars": { "OPENAI_COMPAT_API_KEY": "official-secret" }
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-    let harnesses = custom_gateway_harnesses();
-
-    migrate_openai_credentials_in_file(&path, None, None, &harnesses).unwrap();
-    let global: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-
-    assert_eq!(global["provider"], "openai");
-    assert_eq!(global["env_vars"][OPENAI_API_KEY], "official-secret");
-    assert!(global["env_vars"].get(OPENAI_COMPAT_API_KEY).is_none());
-}
-
-#[test]
-fn runtime_less_record_ignores_custom_preferred_runtime() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("managed-agents.json");
-    std::fs::write(
-        &path,
-        serde_json::to_vec(&serde_json::json!([{
-            "pubkey": "agent-pubkey",
-            "provider": "openai",
-            "env_vars": { "OPENAI_COMPAT_API_KEY": "official-secret" }
-        }]))
-        .unwrap(),
-    )
-    .unwrap();
-    let harnesses = custom_gateway_harnesses();
-
-    migrate_openai_credentials_in_file(&path, None, None, &harnesses).unwrap();
-    let records: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-
-    assert_eq!(records[0]["provider"], "openai");
-    assert_eq!(records[0]["env_vars"][OPENAI_API_KEY], "official-secret");
-}
-
-#[test]
-fn command_override_does_not_suppress_record_runtime_env() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("managed-agents.json");
-    std::fs::write(
-        &path,
-        serde_json::to_vec(&serde_json::json!([{
-            "pubkey": "agent-pubkey",
-            "runtime": "custom-gateway",
-            "agent_command_override": "buzz-agent",
-            "provider": "openai",
-            "env_vars": { "OPENAI_COMPAT_API_KEY": "official-secret" }
-        }]))
-        .unwrap(),
-    )
-    .unwrap();
-    let harnesses = custom_gateway_harnesses();
-
-    migrate_openai_credentials_in_file(&path, None, None, &harnesses).unwrap();
-    let records: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-
-    assert_eq!(records[0]["provider"], "openai-compat");
-    assert_eq!(
-        records[0]["env_vars"][OPENAI_COMPAT_API_KEY],
-        "official-secret"
-    );
-    assert!(records[0]["env_vars"].get(OPENAI_API_KEY).is_none());
-}
-
-#[test]
-fn inherited_openai_is_materialized_when_local_endpoint_is_compat() {
-    let dir = tempfile::tempdir().unwrap();
-    let global_path = dir.path().join("global-agent-config.json");
-    let managed_path = dir.path().join("managed-agents.json");
-    std::fs::write(
-        &global_path,
-        serde_json::to_vec(&serde_json::json!({
-            "provider": "openai",
-            "env_vars": {}
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-    std::fs::write(
-        &managed_path,
-        serde_json::to_vec(&serde_json::json!([{
-            "pubkey": "agent-pubkey",
-            "agent_command_override": "buzz-agent",
-            "env_vars": {
-                "OPENAI_COMPAT_BASE_URL": "https://gateway.example/v1",
-                "OPENAI_COMPAT_API_KEY": "compat-secret"
-            }
-        }]))
-        .unwrap(),
-    )
-    .unwrap();
-    let harnesses = std::collections::HashMap::new();
-
-    migrate_openai_credentials_in_file(&global_path, None, None, &harnesses).unwrap();
-    let global: Value =
-        serde_json::from_str(&std::fs::read_to_string(&global_path).unwrap()).unwrap();
-    migrate_openai_credentials_in_file(
-        &managed_path,
-        global.get("provider").and_then(Value::as_str),
-        global.get("env_vars").and_then(Value::as_object),
-        &harnesses,
-    )
-    .unwrap();
-    let records: Value =
-        serde_json::from_str(&std::fs::read_to_string(&managed_path).unwrap()).unwrap();
-
-    assert_eq!(records[0]["provider"], "openai-compat");
-    assert_eq!(
-        records[0]["env_vars"][OPENAI_COMPAT_API_KEY],
-        "compat-secret"
+        store.records[0].env_vars.get(OPENAI_API_KEY).unwrap(),
+        "official"
     );
     assert_eq!(
-        records[0]["env_vars"][OPENAI_COMPAT_BASE_URL],
-        "https://gateway.example/v1"
+        store.records[0]
+            .env_vars
+            .get(OPENAI_COMPAT_API_KEY)
+            .unwrap(),
+        "compat"
     );
-    assert!(records[0]["env_vars"].get(OPENAI_API_KEY).is_none());
-    assert!(sibling_path(&managed_path, MIGRATION_SUFFIX).exists());
 }
 
 #[test]
-fn inherited_openai_is_materialized_on_providerless_definition() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("managed-agents.json");
-    std::fs::write(
-        &path,
-        serde_json::to_vec(&serde_json::json!([
-            {
-                "pubkey": "",
-                "slug": "shared-definition",
-                "env_vars": {
-                    "OPENAI_COMPAT_BASE_URL": "https://gateway.example/v1",
-                    "OPENAI_COMPAT_API_KEY": "definition-secret"
-                }
-            },
-            {
-                "pubkey": "agent-pubkey",
-                "persona_id": "shared-definition",
-                "env_vars": {}
-            }
-        ]))
-        .unwrap(),
-    )
-    .unwrap();
-
-    migrate_file(&path, Some("openai"), None).unwrap();
-    let records: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-
-    assert_eq!(records[0]["provider"], "openai-compat");
-    assert_eq!(
-        records[0]["env_vars"][OPENAI_COMPAT_API_KEY],
-        "definition-secret"
+fn mixed_global_provider_owner_is_rejected() {
+    let global = GlobalAgentConfig {
+        provider: Some("openai".into()),
+        ..Default::default()
+    };
+    let mut official = record("official", "official");
+    official
+        .env_vars
+        .insert(OPENAI_COMPAT_API_KEY.into(), "a".into());
+    let mut custom = record("custom", "custom");
+    custom
+        .env_vars
+        .insert(OPENAI_COMPAT_API_KEY.into(), "b".into());
+    custom.env_vars.insert(
+        OPENAI_COMPAT_BASE_URL.into(),
+        "https://gateway.example/v1".into(),
     );
-    assert!(records[1].get("provider").is_none());
-    assert!(sibling_path(&path, MIGRATION_SUFFIX).exists());
+    assert!(planned(global, vec![official, custom])
+        .unwrap_err()
+        .contains("mixed official/custom"));
 }
 
 #[test]
-fn linked_local_endpoint_conflict_is_left_unwritten_and_unmarked() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("managed-agents.json");
-    let original = serde_json::to_vec(&serde_json::json!([
-        {
-            "pubkey": "",
-            "slug": "shared-definition",
-            "provider": "openai",
-            "env_vars": {}
-        },
-        {
-            "pubkey": "agent-pubkey",
-            "persona_id": "shared-definition",
-            "env_vars": {
-                "OPENAI_COMPAT_BASE_URL": "https://gateway.example/v1",
-                "OPENAI_COMPAT_API_KEY": "compat-secret"
-            }
-        }
-    ]))
-    .unwrap();
-    std::fs::write(&path, &original).unwrap();
+fn mixed_global_credential_owner_is_rejected_even_for_unrelated_consumer() {
+    let global = GlobalAgentConfig {
+        provider: Some("openai".into()),
+        env_vars: BTreeMap::from([(OPENAI_COMPAT_API_KEY.into(), "shared".into())]),
+        ..Default::default()
+    };
+    let official = record("official", "official");
+    let mut unrelated = record("unrelated", "unrelated");
+    unrelated.provider = Some("anthropic".into());
+    assert!(planned(global, vec![official, unrelated])
+        .unwrap_err()
+        .contains("shared with a non-official consumer"));
+}
 
-    let error = migrate_file(&path, Some("openai"), None).unwrap_err();
+#[test]
+fn linked_provider_snapshot_is_ignored_and_definition_is_mutated() {
+    let mut def = definition("shared");
+    def.provider = Some("openai".into());
+    def.env_vars.insert(
+        OPENAI_COMPAT_BASE_URL.into(),
+        "https://gateway.example/v1".into(),
+    );
+    let mut instance = record("instance", "instance");
+    instance.persona_id = Some("shared".into());
+    instance.provider = Some("anthropic".into());
+    instance
+        .env_vars
+        .insert(OPENAI_COMPAT_API_KEY.into(), "compat".into());
+    let store = planned(GlobalAgentConfig::default(), vec![def, instance]).unwrap();
+    assert_eq!(store.records[0].provider.as_deref(), Some("openai-compat"));
+    assert_eq!(store.records[1].provider.as_deref(), Some("anthropic"));
+}
 
+#[test]
+fn linked_local_identity_that_definition_cannot_represent_is_rejected() {
+    let mut def = definition("shared");
+    def.provider = Some("openai".into());
+    let mut official = record("official", "official");
+    official.persona_id = Some("shared".into());
+    official
+        .env_vars
+        .insert(OPENAI_COMPAT_API_KEY.into(), "a".into());
+    let mut custom = record("custom", "custom");
+    custom.persona_id = Some("shared".into());
+    custom
+        .env_vars
+        .insert(OPENAI_COMPAT_API_KEY.into(), "b".into());
+    custom.env_vars.insert(
+        OPENAI_COMPAT_BASE_URL.into(),
+        "https://gateway.example/v1".into(),
+    );
     assert!(
-        error.contains("cannot migrate a linked instance"),
-        "{error}"
+        planned(GlobalAgentConfig::default(), vec![def, official, custom])
+            .unwrap_err()
+            .contains("mixed official/custom")
     );
-    assert_eq!(std::fs::read(&path).unwrap(), original);
-    assert!(!sibling_path(&path, BACKUP_SUFFIX).exists());
-    assert!(!sibling_path(&path, MIGRATION_SUFFIX).exists());
 }
 
 #[test]
-fn linked_instance_uses_definition_provider_and_layered_endpoint() {
+fn first_fold_builtin_link_does_not_block_unrelated_official_consumer() {
+    let mut builtin = record("builtin", "builtin");
+    builtin.persona_id = Some("builtin:fizz".into());
+    let mut official = record("official", "official");
+    official.provider = Some("openai".into());
+    official
+        .env_vars
+        .insert(OPENAI_COMPAT_API_KEY.into(), "secret".into());
+    let store = planned(GlobalAgentConfig::default(), vec![builtin, official]).unwrap();
+    assert_eq!(
+        store.records[1]
+            .env_vars
+            .get(OPENAI_API_KEY)
+            .map(String::as_str),
+        Some("secret")
+    );
+}
+
+#[test]
+fn shared_global_official_alias_with_non_openai_consumer_is_rejected() {
+    let global = GlobalAgentConfig {
+        provider: Some("openai".into()),
+        env_vars: BTreeMap::from([(
+            OPENAI_COMPAT_BASE_URL.into(),
+            "https://api.openai.com".into(),
+        )]),
+        ..Default::default()
+    };
+    let official = record("official", "official");
+    let mut unrelated = record("unrelated", "unrelated");
+    unrelated.provider = Some("anthropic".into());
+    assert!(planned(global, vec![official, unrelated])
+        .unwrap_err()
+        .contains("endpoint owner"));
+}
+
+#[test]
+fn builtin_read_only_provider_is_accepted_when_identity_already_matches() {
+    let mut builtin = record("builtin", "builtin");
+    builtin.persona_id = Some("builtin:fizz".into());
+    assert!(planned(GlobalAgentConfig::default(), vec![builtin]).is_ok());
+}
+
+#[test]
+fn canonical_local_shadow_is_preserved_over_inherited_custom_origin() {
+    let global = GlobalAgentConfig {
+        env_vars: BTreeMap::from([(
+            OPENAI_COMPAT_BASE_URL.into(),
+            "https://gateway.example/v1".into(),
+        )]),
+        ..Default::default()
+    };
+    let mut agent = record("agent", "agent");
+    agent.provider = Some("openai".into());
+    agent.env_vars.insert(
+        OPENAI_COMPAT_BASE_URL.into(),
+        CANONICAL_OPENAI_ORIGIN.into(),
+    );
+    agent
+        .env_vars
+        .insert(OPENAI_COMPAT_API_KEY.into(), "secret".into());
+    let store = planned(global, vec![agent]).unwrap();
+    assert_eq!(
+        store.records[0]
+            .env_vars
+            .get(OPENAI_COMPAT_BASE_URL)
+            .map(String::as_str),
+        Some(CANONICAL_OPENAI_ORIGIN)
+    );
+}
+
+#[test]
+fn dangling_runtime_requires_command_override() {
+    let mut agent = record("agent", "agent");
+    agent.provider = Some("openai".into());
+    agent.runtime = Some("missing-custom-runtime".into());
+    agent
+        .env_vars
+        .insert(OPENAI_COMPAT_API_KEY.into(), "secret".into());
+    assert!(planned(GlobalAgentConfig::default(), vec![agent.clone()])
+        .unwrap_err()
+        .contains("unresolved custom harness"));
+    agent.agent_command_override = Some("buzz-agent".into());
+    assert!(planned(GlobalAgentConfig::default(), vec![agent]).is_ok());
+}
+
+#[test]
+fn semantic_failure_creates_no_transaction_artifacts() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("managed-agents.json");
+    let agents = dir.path();
+    let mut agent = record("agent", "agent");
+    agent.provider = Some("openai".into());
+    agent
+        .env_vars
+        .insert(OPENAI_COMPAT_BASE_URL.into(), "broken".into());
     std::fs::write(
-        &path,
-        serde_json::to_vec(&serde_json::json!([
-            {
-                "pubkey": "",
-                "slug": "shared-definition",
-                "provider": "openai",
-                "env_vars": {
-                    "OPENAI_COMPAT_API_KEY": "definition-compat-key",
-                    "OPENAI_COMPAT_BASE_URL": "https://gateway.example/v1"
-                }
-            },
-            {
-                "pubkey": "agent-pubkey",
-                "persona_id": "shared-definition",
-                "provider": "openai",
-                "env_vars": { "OPENAI_COMPAT_API_KEY": "instance-compat-key" }
-            }
-        ]))
-        .unwrap(),
+        agents.join("managed-agents.json"),
+        serde_json::to_vec(&vec![agent]).unwrap(),
     )
     .unwrap();
-
-    migrate_file(&path, Some("openai"), None).unwrap();
-    let records: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-
-    assert_eq!(records[0]["provider"], "openai-compat");
-    assert_eq!(
-        records[1]["provider"], "openai",
-        "linked instance provider is a stale snapshot and is not an ownership tier"
-    );
-    assert_eq!(
-        records[1]["env_vars"][OPENAI_COMPAT_API_KEY],
-        "instance-compat-key"
-    );
-    assert!(records[1]["env_vars"].get(OPENAI_API_KEY).is_none());
+    assert!(migrate_pair(agents).is_err());
+    assert!(!agents.join(MANIFEST_FILE).exists());
+    assert!(!agents.join(MARKER_FILE).exists());
+    assert!(!sibling_path(&agents.join("managed-agents.json"), BACKUP_SUFFIX).exists());
 }
 
 #[test]
-fn linked_instance_ignores_legacy_provider_snapshot_when_definition_uses_global() {
+fn stale_backup_is_refused_before_manifest_or_config_write() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("managed-agents.json");
+    let agents = dir.path();
+    let mut agent = record("agent", "agent");
+    agent.provider = Some("openai".into());
+    agent
+        .env_vars
+        .insert(OPENAI_COMPAT_API_KEY.into(), "secret".into());
+    let source = serde_json::to_vec(&vec![agent]).unwrap();
+    let path = agents.join("managed-agents.json");
+    std::fs::write(&path, &source).unwrap();
+    std::fs::write(sibling_path(&path, BACKUP_SUFFIX), b"stale").unwrap();
+    assert!(migrate_pair(agents)
+        .unwrap_err()
+        .contains("backup does not match pristine source"));
+    assert_eq!(std::fs::read(path).unwrap(), source);
+    assert!(!agents.join(MANIFEST_FILE).exists());
+    assert!(!agents.join(MARKER_FILE).exists());
+}
+
+#[test]
+fn transaction_writes_backups_manifest_targets_then_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let agents = dir.path();
+    let global = GlobalAgentConfig {
+        provider: Some("openai".into()),
+        ..Default::default()
+    };
+    let mut agent = record("agent", "agent");
+    agent
+        .env_vars
+        .insert(OPENAI_COMPAT_API_KEY.into(), "secret".into());
     std::fs::write(
-        &path,
-        serde_json::to_vec(&serde_json::json!([
-            {
-                "pubkey": "",
-                "slug": "shared-definition",
-                "provider": null,
-                "env_vars": {}
-            },
-            {
-                "pubkey": "agent-pubkey",
-                "persona_id": "shared-definition",
-                "provider": "anthropic",
-                "env_vars": { "OPENAI_COMPAT_API_KEY": "legacy-official-key" }
-            }
-        ]))
-        .unwrap(),
+        agents.join("global-agent-config.json"),
+        serde_json::to_vec(&global).unwrap(),
     )
     .unwrap();
-
-    migrate_file(&path, Some("openai"), None).unwrap();
-    let records: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-
-    assert_eq!(records[1]["provider"], "anthropic");
-    assert_eq!(
-        records[1]["env_vars"][OPENAI_API_KEY],
-        "legacy-official-key"
-    );
-    assert!(records[1]["env_vars"].get(OPENAI_COMPAT_API_KEY).is_none());
-}
-
-#[test]
-fn array_migration_updates_every_record() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("managed-agents.json");
     std::fs::write(
-        &path,
-        serde_json::to_vec(&serde_json::json!([
-            {
-                "provider": "openai",
-                "env_vars": { "OPENAI_COMPAT_API_KEY": "first" }
-            },
-            {
-                "provider": "openai",
-                "env_vars": { "OPENAI_COMPAT_API_KEY": "second" }
-            }
-        ]))
-        .unwrap(),
+        agents.join("managed-agents.json"),
+        serde_json::to_vec(&vec![agent]).unwrap(),
     )
     .unwrap();
-
-    migrate_file(&path, None, None).unwrap();
-    let records: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    assert_eq!(records[0]["env_vars"][OPENAI_API_KEY], "first");
-    assert_eq!(records[1]["env_vars"][OPENAI_API_KEY], "second");
+    migrate_pair(agents).unwrap();
+    assert!(agents.join(MANIFEST_FILE).exists());
+    assert!(agents.join(MARKER_FILE).exists());
+    assert!(sibling_path(&agents.join("global-agent-config.json"), BACKUP_SUFFIX).exists());
+    assert!(sibling_path(&agents.join("managed-agents.json"), BACKUP_SUFFIX).exists());
+    let reread: Vec<ManagedAgentRecord> =
+        serde_json::from_slice(&std::fs::read(agents.join("managed-agents.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        reread[0].env_vars.get(OPENAI_API_KEY).map(String::as_str),
+        Some("secret")
+    );
 }
 
 #[test]
-fn migration_marker_preserves_post_upgrade_compat_credentials() {
+fn marker_write_failure_leaves_verified_targets_retryable() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("managed-agents.json");
+    let agents = dir.path();
+    let mut agent = record("agent", "agent");
+    agent.provider = Some("openai".into());
+    agent
+        .env_vars
+        .insert(OPENAI_COMPAT_API_KEY.into(), "secret".into());
     std::fs::write(
-        &path,
-        serde_json::to_vec(&serde_json::json!([{
-            "provider": "openai",
-            "env_vars": { "OPENAI_COMPAT_API_KEY": "legacy-secret" }
-        }]))
-        .unwrap(),
+        agents.join("managed-agents.json"),
+        serde_json::to_vec(&vec![agent]).unwrap(),
     )
     .unwrap();
+    std::fs::create_dir(agents.join(MARKER_FILE)).unwrap();
 
-    migrate_file(&path, None, None).unwrap();
-    let mut records: Value =
-        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    records[0]["env_vars"][OPENAI_COMPAT_API_KEY] = Value::String("new-compat".to_string());
-    std::fs::write(&path, serde_json::to_vec(&records).unwrap()).unwrap();
-
-    migrate_file(&path, None, None).unwrap();
-    let records: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    assert_eq!(records[0]["env_vars"][OPENAI_API_KEY], "legacy-secret");
-    assert_eq!(records[0]["env_vars"][OPENAI_COMPAT_API_KEY], "new-compat");
-}
-
-#[test]
-fn changed_file_gets_pristine_backup_before_marker() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("global-agent-config.json");
-    let original = serde_json::json!({
-        "provider": "openai",
-        "env_vars": { "OPENAI_COMPAT_API_KEY": "official-secret" }
-    });
-    let original_bytes = serde_json::to_vec(&original).unwrap();
-    std::fs::write(&path, &original_bytes).unwrap();
-
-    migrate_file(&path, None, None).unwrap();
-
+    assert!(migrate_pair(agents).is_err());
+    assert!(agents.join(MANIFEST_FILE).exists());
+    let target: Vec<ManagedAgentRecord> =
+        serde_json::from_slice(&std::fs::read(agents.join("managed-agents.json")).unwrap())
+            .unwrap();
     assert_eq!(
-        std::fs::read(sibling_path(&path, BACKUP_SUFFIX)).unwrap(),
-        original_bytes
+        target[0].env_vars.get(OPENAI_API_KEY).map(String::as_str),
+        Some("secret")
     );
-    assert_eq!(
-        std::fs::read_to_string(sibling_path(&path, MIGRATION_SUFFIX)).unwrap(),
-        "1\n"
-    );
-    let migrated: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    assert_eq!(migrated["env_vars"][OPENAI_API_KEY], "official-secret");
+
+    std::fs::remove_dir(agents.join(MARKER_FILE)).unwrap();
+    migrate_pair(agents).unwrap();
+    assert_eq!(std::fs::read(agents.join(MARKER_FILE)).unwrap(), b"1\n");
 }
 
 #[test]
-fn malformed_file_is_preserved_and_not_marked() {
+fn malformed_marker_does_not_suppress_retry() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("managed-agents.json");
-    let original = b"{ not valid json";
-    std::fs::write(&path, original).unwrap();
-
-    let error = migrate_file(&path, None, None).unwrap_err();
-
-    assert!(error.contains("failed to parse"), "{error}");
-    assert_eq!(std::fs::read(&path).unwrap(), original);
-    assert!(!sibling_path(&path, BACKUP_SUFFIX).exists());
-    assert!(!sibling_path(&path, MIGRATION_SUFFIX).exists());
+    let agents = dir.path();
+    let mut agent = record("agent", "agent");
+    agent.provider = Some("openai".into());
+    agent
+        .env_vars
+        .insert(OPENAI_COMPAT_API_KEY.into(), "secret".into());
+    std::fs::write(
+        agents.join("managed-agents.json"),
+        serde_json::to_vec(&vec![agent]).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(agents.join(MARKER_FILE), b"").unwrap();
+    migrate_pair(agents).unwrap();
+    assert_eq!(std::fs::read(agents.join(MARKER_FILE)).unwrap(), b"1\n");
 }
 
 #[test]
-fn absent_file_is_not_marked_so_later_legacy_content_can_be_migrated() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("global-agent-config.json");
-    migrate_file(&path, None, None).unwrap();
-    assert!(!sibling_path(&path, MIGRATION_SUFFIX).exists());
-    let legacy = serde_json::json!({
-        "provider": "openai",
-        "env_vars": { "OPENAI_COMPAT_API_KEY": "official-secret" }
-    });
-    std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+fn post_write_verification_rejects_hash_mismatch() {
+    let mut agent = record("agent", "agent");
+    agent.provider = Some("openai".into());
+    agent
+        .env_vars
+        .insert(OPENAI_COMPAT_API_KEY.into(), "secret".into());
+    let source = serde_json::to_vec(&vec![agent]).unwrap();
+    let plan = make_plan(None, Some(&source)).unwrap();
+    let expected = TransactionManifest {
+        global: FileHashes {
+            source: None,
+            target: hash(plan.global.as_deref()),
+        },
+        managed: FileHashes {
+            source: hash(Some(&source)),
+            target: hash(plan.managed.as_deref()),
+        },
+    };
 
-    migrate_file(&path, None, None).unwrap();
-    let after: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    assert_eq!(after["env_vars"][OPENAI_API_KEY], "official-secret");
-    assert!(after["env_vars"].get(OPENAI_COMPAT_API_KEY).is_none());
+    let err = verify_written_targets(&expected, &plan.consumers, None, Some(b"[]")).unwrap_err();
+    assert!(err.contains("target hash mismatch"));
+}
+
+#[test]
+fn partial_retry_finishes_expected_target_but_refuses_external_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    let agents = dir.path();
+    let global_bytes = serde_json::to_vec(&GlobalAgentConfig {
+        provider: Some("openai".into()),
+        ..Default::default()
+    })
+    .unwrap();
+    let mut agent = record("agent", "agent");
+    agent
+        .env_vars
+        .insert(OPENAI_COMPAT_API_KEY.into(), "secret".into());
+    let managed_bytes = serde_json::to_vec(&vec![agent]).unwrap();
+    let plan = make_plan(Some(&global_bytes), Some(&managed_bytes)).unwrap();
+    std::fs::write(
+        agents.join("global-agent-config.json"),
+        plan.global.as_ref().unwrap(),
+    )
+    .unwrap();
+    std::fs::write(agents.join("managed-agents.json"), &managed_bytes).unwrap();
+    std::fs::write(
+        sibling_path(&agents.join("global-agent-config.json"), BACKUP_SUFFIX),
+        &global_bytes,
+    )
+    .unwrap();
+    std::fs::write(
+        sibling_path(&agents.join("managed-agents.json"), BACKUP_SUFFIX),
+        &managed_bytes,
+    )
+    .unwrap();
+    let manifest = TransactionManifest {
+        global: FileHashes {
+            source: hash(Some(&global_bytes)),
+            target: hash(plan.global.as_deref()),
+        },
+        managed: FileHashes {
+            source: hash(Some(&managed_bytes)),
+            target: hash(plan.managed.as_deref()),
+        },
+    };
+    std::fs::write(
+        agents.join(MANIFEST_FILE),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    migrate_pair(agents).unwrap();
+    assert!(agents.join(MARKER_FILE).exists());
+
+    std::fs::remove_file(agents.join(MARKER_FILE)).unwrap();
+    std::fs::write(agents.join("managed-agents.json"), b"[]").unwrap();
+    assert!(migrate_pair(agents).unwrap_err().contains("external edit"));
 }

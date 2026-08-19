@@ -173,7 +173,6 @@ fn run_boot_migrations_inner(app: &tauri::AppHandle, reset_completed: bool) {
     // Post-fold runtime reads fall back to unified-store definitions.
     fold_personas_into_agent_store(app);
     pollen::migrate_pollen_agent_name(app);
-    openai_credentials::migrate_openai_credentials(app);
     // Clean the legacy baked team-instructions suffix out of stored prompts
     // AFTER the fold (so definitions lifted out of personas.json are cleaned in
     // the same boot) and BEFORE backfill_standalone_agents (so a manufactured
@@ -190,6 +189,7 @@ fn run_boot_migrations_inner(app: &tauri::AppHandle, reset_completed: bool) {
     reconcile_provider_mcp_commands(app);
     reconcile_databricks_v1_to_v2(app);
     materialize_agent_runtimes(app);
+    openai_credentials::migrate_openai_credentials(app);
 }
 
 /// Copy one-time app state from the legacy app identifier directory to
