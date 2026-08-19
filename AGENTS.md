@@ -394,6 +394,8 @@ build or preview server before later storage access can misreport it as a
 `bootstrapE2ePage(page)` after setup. Keep storage init scripts origin-guarded;
 do not suppress storage errors.
 
+Rejects loop coverage when the condition is the boolean literal false, or when for...of / for...in uses a statically empty literal iterable/object; transparent parentheses around those literals are equivalent. Other runtime or constant-expression iteration counts are outside this syntactic check.
+
 **Live messages:** Call `waitForMockLiveSubscription(page, channelName)` before
 `__BUZZ_E2E_EMIT_MOCK_MESSAGE__` — messages are silently dropped without a
 subscription. Navigate to the channel first (triggers subscription), then away

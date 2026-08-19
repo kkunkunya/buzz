@@ -53,6 +53,14 @@ for (const [project, checkerPath] of projects) {
     );
   });
 
+  test(`${project}: ignores destructuring property keys with different bound locals`, () => {
+    accepts(
+      spec(
+        "const { test: localTest, bootstrapE2ePage: localBootstrap } = helpers; void localTest; void localBootstrap; await bootstrapE2ePage(page);",
+      ),
+    );
+  });
+
   for (const [name, source] of [
     [
       ".ts helper suffix",
@@ -120,6 +128,62 @@ for (const [project, checkerPath] of projects) {
     [
       "shadowed bootstrap",
       `${imports}\ntest("x", async ({ page }) => { const bootstrapE2ePage = async () => {}; await bootstrapE2ePage(page); });`,
+    ],
+    [
+      "object shorthand binding shadow",
+      spec(
+        "const { bootstrapE2ePage } = helpers; await bootstrapE2ePage(page);",
+      ),
+    ],
+    [
+      "nested object alias binding shadow",
+      spec(
+        "const { bootstrap: { run: bootstrapE2ePage } } = helpers; await bootstrapE2ePage(page);",
+      ),
+    ],
+    [
+      "nested array default binding shadow",
+      spec("const [[test = fallback]] = values; await bootstrapE2ePage(page);"),
+    ],
+    [
+      "object rest binding shadow",
+      spec(
+        "const { ignored, ...bootstrapE2ePage } = helpers; await bootstrapE2ePage(page);",
+      ),
+    ],
+    [
+      "destructured function parameter shadow",
+      spec(
+        "function configure({ nested: [bootstrapE2ePage] }) {} await bootstrapE2ePage(page);",
+      ),
+    ],
+    [
+      "destructured arrow parameter shadow",
+      spec(
+        "const configure = ([{ test }]) => {}; await bootstrapE2ePage(page);",
+      ),
+    ],
+    [
+      "destructured method parameter shadow",
+      spec(
+        "class Harness { configure({ helper: { bootstrapE2ePage = fallback } }) {} } await bootstrapE2ePage(page);",
+      ),
+    ],
+    [
+      "parenthesized false condition",
+      spec("while (((false))) { await bootstrapE2ePage(page); }"),
+    ],
+    [
+      "parenthesized empty array iterable",
+      spec("for (const value of (([]))) { await bootstrapE2ePage(page); }"),
+    ],
+    [
+      "parenthesized empty string iterable",
+      spec('for (const value of ((""))) { await bootstrapE2ePage(page); }'),
+    ],
+    [
+      "parenthesized empty object for-in",
+      spec("for (const key in (({}))) { await bootstrapE2ePage(page); }"),
     ],
   ]) {
     test(`${project}: rejects ${name}`, () => rejects(source));

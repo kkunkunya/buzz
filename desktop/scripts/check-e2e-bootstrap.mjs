@@ -54,14 +54,29 @@ function helperImport(file, filename, canonicalHelperPath) {
   }
 }
 
+function bindingNameShadows(name, canonical) {
+  if (ts.isIdentifier(name))
+    return name.text === canonical.test || name.text === canonical.bootstrap;
+  return name.elements.some(
+    (element) =>
+      !ts.isOmittedExpression(element) &&
+      bindingNameShadows(element.name, canonical),
+  );
+}
+
 function hasShadowingDeclaration(file, canonical) {
   let shadowed = false;
   const visit = (node) => {
     if (shadowed) return;
     if (
-      (ts.isVariableDeclaration(node) ||
-        ts.isFunctionDeclaration(node) ||
-        ts.isClassDeclaration(node)) &&
+      ts.isVariableDeclaration(node) &&
+      bindingNameShadows(node.name, canonical)
+    ) {
+      shadowed = true;
+      return;
+    }
+    if (
+      (ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node)) &&
       node.name &&
       ts.isIdentifier(node.name) &&
       (node.name.text === canonical.test ||
@@ -73,12 +88,10 @@ function hasShadowingDeclaration(file, canonical) {
     if (
       (ts.isArrowFunction(node) ||
         ts.isFunctionExpression(node) ||
-        ts.isFunctionDeclaration(node)) &&
-      node.parameters.some(
-        (parameter) =>
-          ts.isIdentifier(parameter.name) &&
-          (parameter.name.text === canonical.test ||
-            parameter.name.text === canonical.bootstrap),
+        ts.isFunctionDeclaration(node) ||
+        ts.isMethodDeclaration(node)) &&
+      node.parameters.some((parameter) =>
+        bindingNameShadows(parameter.name, canonical),
       )
     ) {
       shadowed = true;
@@ -135,24 +148,38 @@ function isAwaitedCall(statement, name) {
   );
 }
 
+function unwrapParentheses(expression) {
+  while (ts.isParenthesizedExpression(expression))
+    expression = expression.expression;
+  return expression;
+}
+
 function isStaticallyEmptyLoop(statement) {
-  if (ts.isForStatement(statement))
-    return statement.condition?.kind === ts.SyntaxKind.FalseKeyword;
+  if (ts.isForStatement(statement)) {
+    const condition = statement.condition
+      ? unwrapParentheses(statement.condition)
+      : undefined;
+    return condition?.kind === ts.SyntaxKind.FalseKeyword;
+  }
   if (ts.isWhileStatement(statement))
-    return statement.expression.kind === ts.SyntaxKind.FalseKeyword;
+    return (
+      unwrapParentheses(statement.expression).kind ===
+      ts.SyntaxKind.FalseKeyword
+    );
   if (ts.isForOfStatement(statement)) {
-    const expression = statement.expression;
+    const expression = unwrapParentheses(statement.expression);
     return (
       (ts.isArrayLiteralExpression(expression) &&
         !expression.elements.length) ||
       (ts.isStringLiteral(expression) && !expression.text.length)
     );
   }
-  if (ts.isForInStatement(statement))
+  if (ts.isForInStatement(statement)) {
+    const expression = unwrapParentheses(statement.expression);
     return (
-      ts.isObjectLiteralExpression(statement.expression) &&
-      !statement.expression.properties.length
+      ts.isObjectLiteralExpression(expression) && !expression.properties.length
     );
+  }
   return false;
 }
 
