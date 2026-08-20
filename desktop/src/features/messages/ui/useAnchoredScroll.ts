@@ -978,7 +978,10 @@ export function useAnchoredScroll({
       if (atBottom) {
         anchorRef.current = { kind: "at-bottom" };
         setNewMessageCount(0);
-      } else if (anchorRef.current.kind === "at-bottom") {
+      } else if (
+        anchorRef.current.kind === "at-bottom" ||
+        anchorRef.current.kind === "message"
+      ) {
         anchorRef.current = { kind: "virtualized-history" };
       }
       setIsAtBottom(atBottom);

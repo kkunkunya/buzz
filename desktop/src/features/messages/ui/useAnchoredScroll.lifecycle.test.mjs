@@ -266,15 +266,22 @@ function BottomStateHarness({
   return null;
 }
 
-function VirtualBottomStateHarness({ messages, onState, refs }) {
+function VirtualBottomStateHarness({
+  messages,
+  onState,
+  refs,
+  targetMessageId = null,
+}) {
   const anchored = useAnchoredScroll({
     channelId: "conversation",
     contentRef: refs.content,
     isLoading: false,
     messages,
     scrollContainerRef: refs.container,
+    targetMessageId,
     virtualizerOwnsPrependAnchoring: true,
     virtualScrollToBottom: () => {},
+    virtualScrollToMessage: () => true,
   });
   onState(anchored);
   return null;
@@ -437,6 +444,50 @@ test("virtualized history counts live arrivals until the reader returns to botto
   assert.equal(state.isAtBottom, false);
 
   await act(async () => render([{ id: "first" }, { id: "second" }]));
+  assert.equal(state.newMessageCount, 1);
+
+  await act(async () => state.onVirtualizerAtBottomStateChange(true));
+  assert.equal(state.isAtBottom, true);
+  assert.equal(state.newMessageCount, 0);
+  await act(async () => root.unmount());
+});
+
+test("virtualized history target counts live arrivals after a cold jump", async () => {
+  const refs = {
+    container: { current: null },
+    content: { current: null },
+  };
+  const root = createRoot(document.createElement("div"));
+  const nodes = makePinnedCenterNodes();
+  refs.container.current = nodes.container;
+  refs.content.current = nodes.content;
+  let state = null;
+  const render = (messages) =>
+    root.render(
+      React.createElement(VirtualBottomStateHarness, {
+        messages,
+        onState: (nextState) => {
+          state = nextState;
+        },
+        refs,
+        targetMessageId: "selected",
+      }),
+    );
+
+  await act(async () =>
+    render([{ id: "first" }, { id: "selected" }, { id: "latest" }]),
+  );
+  await act(async () => state.onVirtualizerAtBottomStateChange(false));
+
+  await act(async () =>
+    render([
+      { id: "first" },
+      { id: "selected" },
+      { id: "latest" },
+      { id: "new-reply" },
+    ]),
+  );
+  assert.equal(state.isAtBottom, false);
   assert.equal(state.newMessageCount, 1);
 
   await act(async () => state.onVirtualizerAtBottomStateChange(true));
