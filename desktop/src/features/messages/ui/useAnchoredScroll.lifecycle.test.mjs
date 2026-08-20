@@ -292,6 +292,26 @@ function VirtualTargetHarness({ refs }) {
   return null;
 }
 
+function PendingVirtualTargetHarness({ refs, renderVersion }) {
+  useAnchoredScroll({
+    channelId: "conversation",
+    contentRef: refs.content,
+    isLoading: false,
+    messages: refs.messages,
+    onTargetReached: (messageId) => refs.reached.push(messageId),
+    scrollContainerRef: refs.scroller,
+    targetMessageId: "selected",
+    virtualScrollToBottom: () => refs.bottomWrites.push("bottom"),
+    virtualScrollToMessage: (messageId) => {
+      refs.targetWrites.push(messageId);
+      return messageId === "selected";
+    },
+    virtualizerOwnsPrependAnchoring: true,
+    virtualizerRenderVersion: renderVersion,
+  });
+  return null;
+}
+
 test("channel change attaches pinned-center observers after refs mount", async () => {
   const refs = {
     container: { current: null },
@@ -595,5 +615,71 @@ test("mounted virtual target retires bottom intent before direct centering", asy
     "target remains centered after later virtual geometry activity",
   );
   assert.equal(bottomWrites.length, 1, "geometry cannot re-pin to bottom");
+  await act(async () => root.unmount());
+});
+
+test("cold virtual target is not overwritten by the initial bottom pin", async () => {
+  globalThis.ResizeObserver = class {
+    disconnect() {}
+    observe() {}
+  };
+
+  const row = {
+    getBoundingClientRect: () => ({ bottom: 260, height: 40, top: 220 }),
+  };
+  const scroller = {
+    clientHeight: 400,
+    scrollHeight: 10_000,
+    scrollTop: 0,
+    addEventListener() {},
+    getBoundingClientRect: () => ({ bottom: 400, top: 0 }),
+    querySelector: () => (refs.rowMounted ? row : null),
+    querySelectorAll: () => [],
+    removeEventListener() {},
+    scrollBy() {},
+    scrollTo({ top }) {
+      this.scrollTop = top;
+    },
+  };
+  const refs = {
+    bottomWrites: [],
+    content: { current: {} },
+    messages: [{ id: "first" }, { id: "selected" }, { id: "latest" }],
+    reached: [],
+    rowMounted: false,
+    scroller: { current: scroller },
+    targetWrites: [],
+  };
+  const root = createRoot(document.createElement("div"));
+
+  await act(async () => {
+    root.render(
+      React.createElement(PendingVirtualTargetHarness, {
+        refs,
+        renderVersion: 0,
+      }),
+    );
+  });
+
+  assert.ok(refs.targetWrites.length > 0);
+  assert.deepEqual(
+    refs.bottomWrites,
+    [],
+    "accepted virtual target keeps the mount path from pinning to bottom",
+  );
+  assert.deepEqual(refs.reached, []);
+
+  refs.rowMounted = true;
+  await act(async () => {
+    root.render(
+      React.createElement(PendingVirtualTargetHarness, {
+        refs,
+        renderVersion: 1,
+      }),
+    );
+  });
+
+  assert.deepEqual(refs.reached, ["selected"]);
+  assert.deepEqual(refs.bottomWrites, []);
   await act(async () => root.unmount());
 });

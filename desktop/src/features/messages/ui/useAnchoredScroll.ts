@@ -189,6 +189,10 @@ export function useAnchoredScroll({
   const prevMessageCountRef = React.useRef(0);
   const prevMessagesRef = React.useRef<Array<{ id: string }>>([]);
   const handledTargetIdRef = React.useRef<string | null>(null);
+  // A virtualizer can accept a target before that row exists in the DOM.
+  // Keep that request distinct from a genuinely missing target so the initial
+  // mount path does not overwrite the pending jump with a bottom pin.
+  const queuedVirtualTargetIdRef = React.useRef<string | null>(null);
   const highlightTimeoutRef = React.useRef<number | null>(null);
   // Tracks a pending rAF queued by pinToBottomOnMount so it can be cancelled
   // on channel switch (the channelId reset effect clears it).
@@ -226,6 +230,7 @@ export function useAnchoredScroll({
     prevMessageCountRef.current = 0;
     prevMessagesRef.current = [];
     handledTargetIdRef.current = null;
+    queuedVirtualTargetIdRef.current = null;
     forceBottomOnNextAppendRef.current = false;
     settlingRef.current = false;
     programmaticScrollTopRef.current = null;
@@ -453,6 +458,7 @@ export function useAnchoredScroll({
             if (!virtualScrollToMessage(messageId, { behavior: "auto" })) {
               return false;
             }
+            queuedVirtualTargetIdRef.current = messageId;
             anchorRef.current = { kind: "message", messageId, topOffset: 0 };
             setIsAtBottom(false);
             return false;
@@ -473,10 +479,15 @@ export function useAnchoredScroll({
           })
         ) {
           return false;
+        } else {
+          queuedVirtualTargetIdRef.current = messageId;
         }
         anchorRef.current = { kind: "message", messageId, topOffset: 0 };
         setIsAtBottom(false);
-        if (el && options.highlight) highlightMessage(messageId);
+        if (el) {
+          queuedVirtualTargetIdRef.current = null;
+          if (options.highlight) highlightMessage(messageId);
+        }
         return el !== null;
       }
 
@@ -642,7 +653,7 @@ export function useAnchoredScroll({
         ) {
           handledTargetIdRef.current = targetMessageId;
           onTargetReached?.(targetMessageId);
-        } else {
+        } else if (queuedVirtualTargetIdRef.current !== targetMessageId) {
           pinToBottomOnMount();
         }
       } else {
@@ -880,6 +891,7 @@ export function useAnchoredScroll({
   React.useEffect(() => {
     if (!targetMessageId) {
       handledTargetIdRef.current = null;
+      queuedVirtualTargetIdRef.current = null;
       releasePinnedCenter();
       return;
     }
