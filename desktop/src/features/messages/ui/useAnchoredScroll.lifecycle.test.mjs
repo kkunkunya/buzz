@@ -266,6 +266,20 @@ function BottomStateHarness({
   return null;
 }
 
+function VirtualBottomStateHarness({ messages, onState, refs }) {
+  const anchored = useAnchoredScroll({
+    channelId: "conversation",
+    contentRef: refs.content,
+    isLoading: false,
+    messages,
+    scrollContainerRef: refs.container,
+    virtualizerOwnsPrependAnchoring: true,
+    virtualScrollToBottom: () => {},
+  });
+  onState(anchored);
+  return null;
+}
+
 function VirtualTargetHarness({ refs }) {
   const didRun = React.useRef(false);
   const bottomApi = useVirtualizedBottomSettle(
@@ -391,6 +405,41 @@ test("arrival at the physical floor does not preserve a stale unread state", asy
     nodes.container.scrollHeight - nodes.container.clientHeight;
   await act(async () => render([{ id: "first" }, { id: "second" }]));
 
+  assert.equal(state.isAtBottom, true);
+  assert.equal(state.newMessageCount, 0);
+  await act(async () => root.unmount());
+});
+
+test("virtualized history counts live arrivals until the reader returns to bottom", async () => {
+  const refs = {
+    container: { current: null },
+    content: { current: null },
+  };
+  const root = createRoot(document.createElement("div"));
+  const nodes = makePinnedCenterNodes();
+  refs.container.current = nodes.container;
+  refs.content.current = nodes.content;
+  let state = null;
+  const render = (messages) =>
+    root.render(
+      React.createElement(VirtualBottomStateHarness, {
+        messages,
+        onState: (nextState) => {
+          state = nextState;
+        },
+        refs,
+      }),
+    );
+
+  await act(async () => render([{ id: "first" }]));
+  await act(async () => new Promise((resolve) => setTimeout(resolve, 0)));
+  await act(async () => state.onVirtualizerAtBottomStateChange(false));
+  assert.equal(state.isAtBottom, false);
+
+  await act(async () => render([{ id: "first" }, { id: "second" }]));
+  assert.equal(state.newMessageCount, 1);
+
+  await act(async () => state.onVirtualizerAtBottomStateChange(true));
   assert.equal(state.isAtBottom, true);
   assert.equal(state.newMessageCount, 0);
   await act(async () => root.unmount());

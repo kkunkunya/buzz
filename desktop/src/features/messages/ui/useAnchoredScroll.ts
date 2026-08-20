@@ -21,7 +21,8 @@ const AT_BOTTOM_THRESHOLD_PX = 32;
 type AnchorState =
   | { kind: "at-bottom" }
   | { kind: "message"; messageId: string; topOffset: number }
-  | { kind: "pinned-center"; messageId: string; contentTop: number };
+  | { kind: "pinned-center"; messageId: string; contentTop: number }
+  | { kind: "virtualized-history" };
 
 type UseAnchoredScrollOptions = {
   /** Scroll container. Owned by the parent so external refs still compose. */
@@ -726,6 +727,7 @@ export function useAnchoredScroll({
       }
       if (newLatestArrived) setNewMessageCount(0);
     } else if (
+      anchor.kind === "message" &&
       messagesArrived > 0 &&
       !targetMessageId &&
       !virtualizerOwnsPrependAnchoring &&
@@ -741,7 +743,11 @@ export function useAnchoredScroll({
       container.scrollTo({ top: container.scrollHeight, behavior: "auto" });
       setIsAtBottom(true);
       setNewMessageCount(0);
-    } else if (messagesArrived > 0 && !virtualizerOwnsPrependAnchoring) {
+    } else if (
+      anchor.kind === "message" &&
+      messagesArrived > 0 &&
+      !virtualizerOwnsPrependAnchoring
+    ) {
       // Anchored mid-history. An older-history prepend grows the content above
       // the reading row; the browser's native scroll anchoring does NOT correct
       // this at the top edge (no anchor node above the viewport when scrollTop
@@ -766,6 +772,12 @@ export function useAnchoredScroll({
       if (!isPrepend) {
         setNewMessageCount((current) => current + messagesArrived);
       }
+    } else if (
+      anchor.kind === "virtualized-history" &&
+      messagesArrived > 0 &&
+      !isPrepend
+    ) {
+      setNewMessageCount((current) => current + messagesArrived);
     }
 
     prevLastMessageIdRef.current = lastMessage?.id;
@@ -966,6 +978,8 @@ export function useAnchoredScroll({
       if (atBottom) {
         anchorRef.current = { kind: "at-bottom" };
         setNewMessageCount(0);
+      } else if (anchorRef.current.kind === "at-bottom") {
+        anchorRef.current = { kind: "virtualized-history" };
       }
       setIsAtBottom(atBottom);
     },
