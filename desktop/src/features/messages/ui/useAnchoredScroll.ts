@@ -21,7 +21,8 @@ const AT_BOTTOM_THRESHOLD_PX = 32;
 type AnchorState =
   | { kind: "at-bottom" }
   | { kind: "message"; messageId: string; topOffset: number }
-  | { kind: "pinned-center"; messageId: string; contentTop: number };
+  | { kind: "pinned-center"; messageId: string; contentTop: number }
+  | { kind: "virtualized-history" };
 
 type UseAnchoredScrollOptions = {
   /** Scroll container. Owned by the parent so external refs still compose. */
@@ -189,6 +190,10 @@ export function useAnchoredScroll({
   const prevMessageCountRef = React.useRef(0);
   const prevMessagesRef = React.useRef<Array<{ id: string }>>([]);
   const handledTargetIdRef = React.useRef<string | null>(null);
+  // A virtualizer can accept a target before that row exists in the DOM.
+  // Keep that request distinct from a genuinely missing target so the initial
+  // mount path does not overwrite the pending jump with a bottom pin.
+  const queuedVirtualTargetIdRef = React.useRef<string | null>(null);
   const highlightTimeoutRef = React.useRef<number | null>(null);
   // Tracks a pending rAF queued by pinToBottomOnMount so it can be cancelled
   // on channel switch (the channelId reset effect clears it).
@@ -226,6 +231,7 @@ export function useAnchoredScroll({
     prevMessageCountRef.current = 0;
     prevMessagesRef.current = [];
     handledTargetIdRef.current = null;
+    queuedVirtualTargetIdRef.current = null;
     forceBottomOnNextAppendRef.current = false;
     settlingRef.current = false;
     programmaticScrollTopRef.current = null;
@@ -453,6 +459,7 @@ export function useAnchoredScroll({
             if (!virtualScrollToMessage(messageId, { behavior: "auto" })) {
               return false;
             }
+            queuedVirtualTargetIdRef.current = messageId;
             anchorRef.current = { kind: "message", messageId, topOffset: 0 };
             setIsAtBottom(false);
             return false;
@@ -473,10 +480,15 @@ export function useAnchoredScroll({
           })
         ) {
           return false;
+        } else {
+          queuedVirtualTargetIdRef.current = messageId;
         }
         anchorRef.current = { kind: "message", messageId, topOffset: 0 };
         setIsAtBottom(false);
-        if (el && options.highlight) highlightMessage(messageId);
+        if (el) {
+          queuedVirtualTargetIdRef.current = null;
+          if (options.highlight) highlightMessage(messageId);
+        }
         return el !== null;
       }
 
@@ -642,7 +654,7 @@ export function useAnchoredScroll({
         ) {
           handledTargetIdRef.current = targetMessageId;
           onTargetReached?.(targetMessageId);
-        } else {
+        } else if (queuedVirtualTargetIdRef.current !== targetMessageId) {
           pinToBottomOnMount();
         }
       } else {
@@ -715,6 +727,7 @@ export function useAnchoredScroll({
       }
       if (newLatestArrived) setNewMessageCount(0);
     } else if (
+      anchor.kind === "message" &&
       messagesArrived > 0 &&
       !targetMessageId &&
       !virtualizerOwnsPrependAnchoring &&
@@ -730,7 +743,11 @@ export function useAnchoredScroll({
       container.scrollTo({ top: container.scrollHeight, behavior: "auto" });
       setIsAtBottom(true);
       setNewMessageCount(0);
-    } else if (messagesArrived > 0 && !virtualizerOwnsPrependAnchoring) {
+    } else if (
+      anchor.kind === "message" &&
+      messagesArrived > 0 &&
+      !virtualizerOwnsPrependAnchoring
+    ) {
       // Anchored mid-history. An older-history prepend grows the content above
       // the reading row; the browser's native scroll anchoring does NOT correct
       // this at the top edge (no anchor node above the viewport when scrollTop
@@ -755,6 +772,12 @@ export function useAnchoredScroll({
       if (!isPrepend) {
         setNewMessageCount((current) => current + messagesArrived);
       }
+    } else if (
+      anchor.kind === "virtualized-history" &&
+      messagesArrived > 0 &&
+      !isPrepend
+    ) {
+      setNewMessageCount((current) => current + messagesArrived);
     }
 
     prevLastMessageIdRef.current = lastMessage?.id;
@@ -880,6 +903,7 @@ export function useAnchoredScroll({
   React.useEffect(() => {
     if (!targetMessageId) {
       handledTargetIdRef.current = null;
+      queuedVirtualTargetIdRef.current = null;
       releasePinnedCenter();
       return;
     }
@@ -954,6 +978,11 @@ export function useAnchoredScroll({
       if (atBottom) {
         anchorRef.current = { kind: "at-bottom" };
         setNewMessageCount(0);
+      } else if (
+        anchorRef.current.kind === "at-bottom" ||
+        anchorRef.current.kind === "message"
+      ) {
+        anchorRef.current = { kind: "virtualized-history" };
       }
       setIsAtBottom(atBottom);
     },

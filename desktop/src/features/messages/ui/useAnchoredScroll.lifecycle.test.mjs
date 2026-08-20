@@ -266,6 +266,27 @@ function BottomStateHarness({
   return null;
 }
 
+function VirtualBottomStateHarness({
+  messages,
+  onState,
+  refs,
+  targetMessageId = null,
+}) {
+  const anchored = useAnchoredScroll({
+    channelId: "conversation",
+    contentRef: refs.content,
+    isLoading: false,
+    messages,
+    scrollContainerRef: refs.container,
+    targetMessageId,
+    virtualizerOwnsPrependAnchoring: true,
+    virtualScrollToBottom: () => {},
+    virtualScrollToMessage: () => true,
+  });
+  onState(anchored);
+  return null;
+}
+
 function VirtualTargetHarness({ refs }) {
   const didRun = React.useRef(false);
   const bottomApi = useVirtualizedBottomSettle(
@@ -289,6 +310,26 @@ function VirtualTargetHarness({ refs }) {
     bottomApi.settle();
     refs.targetResult.current = anchored.scrollToMessage("selected");
   }, [anchored.scrollToMessage, bottomApi.settle, refs.targetResult]);
+  return null;
+}
+
+function PendingVirtualTargetHarness({ refs, renderVersion }) {
+  useAnchoredScroll({
+    channelId: "conversation",
+    contentRef: refs.content,
+    isLoading: false,
+    messages: refs.messages,
+    onTargetReached: (messageId) => refs.reached.push(messageId),
+    scrollContainerRef: refs.scroller,
+    targetMessageId: "selected",
+    virtualScrollToBottom: () => refs.bottomWrites.push("bottom"),
+    virtualScrollToMessage: (messageId) => {
+      refs.targetWrites.push(messageId);
+      return messageId === "selected";
+    },
+    virtualizerOwnsPrependAnchoring: true,
+    virtualizerRenderVersion: renderVersion,
+  });
   return null;
 }
 
@@ -371,6 +412,85 @@ test("arrival at the physical floor does not preserve a stale unread state", asy
     nodes.container.scrollHeight - nodes.container.clientHeight;
   await act(async () => render([{ id: "first" }, { id: "second" }]));
 
+  assert.equal(state.isAtBottom, true);
+  assert.equal(state.newMessageCount, 0);
+  await act(async () => root.unmount());
+});
+
+test("virtualized history counts live arrivals until the reader returns to bottom", async () => {
+  const refs = {
+    container: { current: null },
+    content: { current: null },
+  };
+  const root = createRoot(document.createElement("div"));
+  const nodes = makePinnedCenterNodes();
+  refs.container.current = nodes.container;
+  refs.content.current = nodes.content;
+  let state = null;
+  const render = (messages) =>
+    root.render(
+      React.createElement(VirtualBottomStateHarness, {
+        messages,
+        onState: (nextState) => {
+          state = nextState;
+        },
+        refs,
+      }),
+    );
+
+  await act(async () => render([{ id: "first" }]));
+  await act(async () => new Promise((resolve) => setTimeout(resolve, 0)));
+  await act(async () => state.onVirtualizerAtBottomStateChange(false));
+  assert.equal(state.isAtBottom, false);
+
+  await act(async () => render([{ id: "first" }, { id: "second" }]));
+  assert.equal(state.newMessageCount, 1);
+
+  await act(async () => state.onVirtualizerAtBottomStateChange(true));
+  assert.equal(state.isAtBottom, true);
+  assert.equal(state.newMessageCount, 0);
+  await act(async () => root.unmount());
+});
+
+test("virtualized history target counts live arrivals after a cold jump", async () => {
+  const refs = {
+    container: { current: null },
+    content: { current: null },
+  };
+  const root = createRoot(document.createElement("div"));
+  const nodes = makePinnedCenterNodes();
+  refs.container.current = nodes.container;
+  refs.content.current = nodes.content;
+  let state = null;
+  const render = (messages) =>
+    root.render(
+      React.createElement(VirtualBottomStateHarness, {
+        messages,
+        onState: (nextState) => {
+          state = nextState;
+        },
+        refs,
+        targetMessageId: "selected",
+      }),
+    );
+
+  await act(async () =>
+    render([{ id: "first" }, { id: "selected" }, { id: "latest" }]),
+  );
+  await act(async () => state.onVirtualizerAtBottomStateChange(false));
+
+  await act(async () =>
+    render([
+      { id: "first" },
+      { id: "selected" },
+      { id: "latest" },
+      { id: "new-reply" },
+    ]),
+  );
+  assert.equal(state.isAtBottom, false);
+  assert.equal(state.newMessageCount, 1);
+
+  await act(async () => state.onVirtualizerAtBottomStateChange(true));
   assert.equal(state.isAtBottom, true);
   assert.equal(state.newMessageCount, 0);
   await act(async () => root.unmount());
@@ -595,5 +715,71 @@ test("mounted virtual target retires bottom intent before direct centering", asy
     "target remains centered after later virtual geometry activity",
   );
   assert.equal(bottomWrites.length, 1, "geometry cannot re-pin to bottom");
+  await act(async () => root.unmount());
+});
+
+test("cold virtual target is not overwritten by the initial bottom pin", async () => {
+  globalThis.ResizeObserver = class {
+    disconnect() {}
+    observe() {}
+  };
+
+  const row = {
+    getBoundingClientRect: () => ({ bottom: 260, height: 40, top: 220 }),
+  };
+  const scroller = {
+    clientHeight: 400,
+    scrollHeight: 10_000,
+    scrollTop: 0,
+    addEventListener() {},
+    getBoundingClientRect: () => ({ bottom: 400, top: 0 }),
+    querySelector: () => (refs.rowMounted ? row : null),
+    querySelectorAll: () => [],
+    removeEventListener() {},
+    scrollBy() {},
+    scrollTo({ top }) {
+      this.scrollTop = top;
+    },
+  };
+  const refs = {
+    bottomWrites: [],
+    content: { current: {} },
+    messages: [{ id: "first" }, { id: "selected" }, { id: "latest" }],
+    reached: [],
+    rowMounted: false,
+    scroller: { current: scroller },
+    targetWrites: [],
+  };
+  const root = createRoot(document.createElement("div"));
+
+  await act(async () => {
+    root.render(
+      React.createElement(PendingVirtualTargetHarness, {
+        refs,
+        renderVersion: 0,
+      }),
+    );
+  });
+
+  assert.ok(refs.targetWrites.length > 0);
+  assert.deepEqual(
+    refs.bottomWrites,
+    [],
+    "accepted virtual target keeps the mount path from pinning to bottom",
+  );
+  assert.deepEqual(refs.reached, []);
+
+  refs.rowMounted = true;
+  await act(async () => {
+    root.render(
+      React.createElement(PendingVirtualTargetHarness, {
+        refs,
+        renderVersion: 1,
+      }),
+    );
+  });
+
+  assert.deepEqual(refs.reached, ["selected"]);
+  assert.deepEqual(refs.bottomWrites, []);
   await act(async () => root.unmount());
 });
